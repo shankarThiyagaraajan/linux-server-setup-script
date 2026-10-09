@@ -60,29 +60,8 @@ Before closing your root session, open a new terminal and confirm `ssh -p 2222 d
 | `essential` | Sudo user with your key, key-only SSH, root locked, UFW, Fail2ban, automatic updates |
 | `full` | Essential plus kernel and DDoS hardening, web flood limits, swap, log cap, admin tools |
 | `doctor` | Read-only scan: PASS / WARN / FAIL, health score, recommended fixes. Exit code 0 / 1 / 2 |
-
-## How it runs
-
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 22, "padding": 6}, "themeVariables": {"fontSize": "12px"}}}%%
-flowchart TD
-    A["Preflight checks"] --> B{"SSH key valid?"}
-    B -- no --> X1["Stop, nothing changed"]
-    B -- yes --> C["Packages, user, SSH config"]
-    C --> D{"sshd test passes?"}
-    D -- no --> X2["Restore SSH backup, stop"]
-    D -- yes --> E["Lock root, firewall, kernel"]
-    E --> F["Fail2ban, auto-updates"]
-    F --> G["Restart SSH on new port"]
-    G --> H["Test new login"]
-
-    classDef stop fill:#fde8e8,stroke:#c0392b,color:#000;
-    classDef live fill:#e3effc,stroke:#2d6fd6,color:#000;
-    class X1,X2 stop;
-    class G live;
-```
-
-Essential and Full follow this flow. The red boxes stop the run before SSH is changed live, and SSH restarts last, after the firewall already allows the port. If the custom firewall rules fail to load, the script falls back to plain UFW and continues.
+| `release-info` | Read-only OS upgrade plan: path (for example 18.04 → 20.04 → 22.04 → 24.04), benefits, known issues, pre-flight checks |
+| `release-upgrade` | Upgrades Ubuntu to the next LTS with `do-release-upgrade`, after a backup confirmation. One step at a time |
 
 ## Do's and Don'ts
 
@@ -100,6 +79,7 @@ Essential and Full follow this flow. The red boxes stop the run before SSH is ch
 
 ## Good to know
 
+- `update` and `upgrade` never change the Ubuntu version. To move to a newer release (for example from 18.04), use `release-info` then `release-upgrade`. Do this before `essential` or `full`: setup refuses Ubuntu older than 20.04.
 - It needs root and an SSH public key, and refuses to turn off password login without one.
 - Every changed file is backed up to `/root/server-setup-backup-<timestamp>/`; the log is `/var/log/server-setup.log`.
 - If you change the SSH port, open it in your cloud provider's firewall too.

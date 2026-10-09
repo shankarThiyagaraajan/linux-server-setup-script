@@ -12,6 +12,8 @@
 #    full        Essential + kernel/DDoS hardening, web flood limits,
 #                swap, log size cap, admin tools
 #    doctor      Read-only scan: PASS / WARN / FAIL with recommended fixes
+#    release-info     Read-only OS upgrade plan: path, benefits, known issues, checks
+#    release-upgrade  Upgrade Ubuntu to the next LTS (one step at a time)
 #
 #  Options:  -y, --yes   never prompt (unattended)      -h, --help   help
 #
@@ -26,7 +28,7 @@
 #  before you log out.
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
 # ------------------------------- Configuration -------------------------------
 # Every value can be set as an environment variable; blanks are prompted for.
@@ -84,6 +86,8 @@ Commands:
   essential   Admin user, key-only SSH, root locked, firewall, Fail2ban, auto-updates
   full        Essential + kernel/DDoS hardening, swap, log cap, admin tools
   doctor      Scan current status and recommend fixes (exit 0/1/2)
+  release-info     Show the OS upgrade path, benefits, known issues and checks (read-only)
+  release-upgrade  Upgrade Ubuntu to the next LTS (asks for a backup confirmation)
 
 Options:
   -y, --yes   Never prompt (unattended)
@@ -98,7 +102,7 @@ for arg in "$@"; do
   case "$arg" in
     -y|--yes) ASSUME_YES=true ;;
     -h|--help|help) usage; exit 0 ;;
-    menu|update|upgrade|essential|full|doctor) MODE=$arg ;;
+    menu|update|upgrade|essential|full|doctor|release-info|release-upgrade) MODE=$arg ;;
     *) usage; die "Unknown command: $arg" ;;
   esac
 done
@@ -206,6 +210,238 @@ task_upgrade() {
   if [[ -f /var/run/reboot-required ]] && $INTERACTIVE && confirm "Reboot now?"; then
     log "Rebooting..."; reboot
   fi
+}
+
+# =============================================================================
+#  OS release upgrade (Ubuntu)
+#
+#  apt upgrade / full-upgrade never change the Ubuntu version. A new release
+#  needs do-release-upgrade, and only one LTS at a time:
+#  18.04 -> 20.04 -> 22.04 -> 24.04
+# =============================================================================
+UBUNTU_LTS_PATH=(18.04 20.04 22.04 24.04)
+R_NAME=""; R_STD_END=""; R_ESM_END=""; R_NEXT=""; R_BENEFITS=""; R_ISSUES=""
+RP_BLOCK=0
+
+release_info() {  # release_info VERSION -> R_* globals (support dates, next hop, benefits, known issues)
+  R_NAME=""; R_STD_END=""; R_ESM_END=""; R_NEXT=""; R_BENEFITS=""; R_ISSUES=""
+  case "$1" in
+    18.04)
+      R_NAME=bionic; R_STD_END=2023-05-31; R_ESM_END=2028-04-30; R_NEXT=20.04
+      R_BENEFITS="- Python 3.8, OpenSSH 8.2 (FIDO keys), kernel 5.4, WireGuard built in
+- Required stepping stone: Ubuntu upgrades one LTS at a time, so keep going to 22.04 and 24.04
+- A newer OpenSSH and OpenSSL, which this script's hardening needs"
+      R_ISSUES="- 'python' (Python 2) is no longer installed by default; old scripts fail
+- Python 3.6 virtualenvs must be rebuilt
+- PHP 7.2 -> 7.4, MySQL 5.7 -> 8.0, PostgreSQL 10 -> 12: back up databases; PostgreSQL needs pg_upgradecluster
+- Third-party PPAs are disabled during the upgrade; re-enable them afterwards
+- Out-of-tree kernel modules (DKMS) may fail to build; 32-bit-only software may stop working" ;;
+    20.04)
+      R_NAME=focal; R_STD_END=2025-05-31; R_ESM_END=2030-04-30; R_NEXT=22.04
+      R_BENEFITS="- Kernel 5.15, Python 3.10, PHP 8.1, OpenSSL 3, newer toolchains
+- Standard security support until April 2027
+- cgroup v2 by default and better container support"
+      R_ISSUES="- OpenSSL 3.0 breaks some older compiled apps (old Ruby, Node and PHP builds)
+- OpenSSH 8.8+ disables SHA-1 'ssh-rsa' signatures: very old SSH clients may be refused
+- cgroup v2: old Docker (before 20.10) and some LXC setups need updating
+- PHP 7.4 -> 8.1 has breaking changes; PostgreSQL 12 -> 14 needs pg_upgradecluster
+- Python 3.8 virtualenvs must be rebuilt" ;;
+    22.04)
+      R_NAME=jammy; R_STD_END=2027-04-30; R_ESM_END=2032-04-30; R_NEXT=24.04
+      R_BENEFITS="- Standard security support until April 2029
+- Kernel 6.8, OpenSSH 9.6, Python 3.12, PHP 8.3, glibc 2.39
+- Newer compilers and runtimes, and better hardware support"
+      R_ISSUES="- SSH uses socket activation (ssh.socket): changing the port only in sshd_config no longer applies. This script handles it
+- System-wide 'pip install' is blocked (PEP 668 'externally-managed-environment'): use a venv or pipx
+- Python 3.12 removed distutils; some old packages fail to install
+- AppArmor restricts unprivileged user namespaces: Chrome, Puppeteer and Electron sandboxes may need a profile
+- APT sources move to /etc/apt/sources.list.d/ubuntu.sources (new format): update config-management templates
+- PostgreSQL 14 -> 16 needs pg_upgradecluster; PHP 8.1 -> 8.3 has deprecations" ;;
+    24.04)
+      R_NAME=noble; R_STD_END=2029-04-30; R_ESM_END=2034-04-30; R_NEXT=""
+      R_BENEFITS="- Current baseline, standard security support until April 2029"
+      R_ISSUES="- A newer LTS may be offered. Check with: do-release-upgrade -c
+- Ubuntu usually offers a new LTS only after its first point release (.1)" ;;
+  esac
+  return 0
+}
+
+release_path_text() {  # 18.04 -> 20.04 -> 22.04 -> 24.04, starting at the current version
+  local v out="" on=false
+  for v in "${UBUNTU_LTS_PATH[@]}"; do
+    [[ $v == "${VERSION_ID:-}" ]] && on=true
+    if $on; then out="${out:+$out → }$v"; fi
+  done
+  printf '%s' "$out"
+}
+
+release_plan() {  # read-only: print the plan and run checks. Sets RP_BLOCK (number of blockers)
+  RP_BLOCK=0
+  local ver=${VERSION_ID:-0} today; today=$(date +%F)
+  step "OS release upgrade plan — ${PRETTY_NAME:-unknown}"
+
+  if [[ ${ID:-} != ubuntu ]]; then
+    warn "A guided release upgrade is built in for Ubuntu only."
+    cat <<EOF
+For Debian, follow the official release notes and upgrade one release at a time:
+  https://www.debian.org/releases/stable/releasenotes
+EOF
+    RP_BLOCK=1; return 0
+  fi
+
+  release_info "$ver"
+  if [[ -z $R_NAME ]]; then
+    warn "Ubuntu $ver is not in this script's release table (interim or very new release)."
+    echo "Ask Ubuntu what it offers:  do-release-upgrade -c"
+    RP_BLOCK=1; return 0
+  fi
+
+  # --- where you are ---
+  local status
+  if [[ $today > $R_STD_END ]]; then
+    status="${c_r}standard support ended $R_STD_END${c_0} (security fixes only with Ubuntu Pro ESM until $R_ESM_END)"
+  elif [[ $today > $(date -d "$R_STD_END -365 days" +%F) ]]; then
+    status="${c_y}standard support ends $R_STD_END${c_0}"
+  else
+    status="${c_g}supported until $R_STD_END${c_0}"
+  fi
+  printf '\n  %-14s Ubuntu %s (%s) — %b\n' "Current:" "$ver" "$R_NAME" "$status"
+
+  if [[ -z $R_NEXT ]]; then
+    printf '  %-14s %s\n' "Upgrade path:" "none in the built-in table. You are on the newest LTS this script knows."
+    printf '\n%sNotes%s\n%s\n' "$c_b" "$c_0" "$R_ISSUES"
+    RP_BLOCK=1; return 0
+  fi
+
+  local next_name next_std
+  local keep_name=$R_NAME keep_issues=$R_ISSUES keep_ben=$R_BENEFITS keep_next=$R_NEXT
+  release_info "$keep_next"; next_name=$R_NAME; next_std=$R_STD_END
+  R_NAME=$keep_name; R_ISSUES=$keep_issues; R_BENEFITS=$keep_ben; R_NEXT=$keep_next
+
+  printf '  %-14s %s  %s(one LTS at a time, reboot between steps)%s\n' "Upgrade path:" "$(release_path_text)" "$c_d" "$c_0"
+  local next_note="supported until $next_std"
+  if [[ $today > $next_std ]]; then next_note="standard support already ended $next_std: keep going to the next LTS after it"; fi
+  printf '  %-14s Ubuntu %s (%s) — %s\n' "Next step:" "$R_NEXT" "$next_name" "$next_note"
+  printf '\n%sWhat you gain%s\n%s\n' "$c_b" "$c_0" "$R_BENEFITS"
+  printf '\n%sKnown issues to check first%s\n%s\n' "$c_b" "$c_0" "$R_ISSUES"
+
+  # --- pre-flight checks ---
+  printf '\n%sPre-flight checks%s\n' "$c_b" "$c_0"
+  local free_gb boot_mb held reboot third p pkgs=""
+  free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+  if (( ${free_gb:-0} < 5 )); then
+    printf '  %s✘%s %s GB free on / (need at least 5 GB)\n' "$c_r" "$c_0" "${free_gb:-0}"; RP_BLOCK=$((RP_BLOCK + 1))
+  else
+    printf '  %s✔%s %s GB free on /\n' "$c_g" "$c_0" "$free_gb"
+  fi
+  if mountpoint -q /boot 2>/dev/null; then
+    boot_mb=$(df -Pm /boot | awk 'NR==2 {print $4}')
+    if (( boot_mb < 300 )); then
+      printf '  %s✘%s only %s MB free on /boot (need 300 MB): remove old kernels with apt autoremove --purge\n' "$c_r" "$c_0" "$boot_mb"; RP_BLOCK=$((RP_BLOCK + 1))
+    fi
+  fi
+  held=$(apt-mark showhold 2>/dev/null | xargs || true)
+  if [[ -n $held ]]; then
+    printf '  %s✘%s held packages block the upgrade: %s (apt-mark unhold <name>)\n' "$c_r" "$c_0" "$held"; RP_BLOCK=$((RP_BLOCK + 1))
+  else
+    printf '  %s✔%s no held packages\n' "$c_g" "$c_0"
+  fi
+  reboot=false; [[ -f /var/run/reboot-required ]] && reboot=true
+  if $reboot; then
+    printf '  %s✘%s a reboot is pending: reboot first, then run this again\n' "$c_r" "$c_0"; RP_BLOCK=$((RP_BLOCK + 1))
+  else
+    printf '  %s✔%s no reboot pending\n' "$c_g" "$c_0"
+  fi
+  third=$(grep -rhsE '^(deb|URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -viE 'ubuntu\.com|ubuntu-ports|ubuntu\.sources' | grep -c . || true)
+  if (( third > 0 )); then
+    printf '  %s!%s %s third-party apt source line(s): they are disabled during the upgrade; re-enable afterwards\n' "$c_y" "$c_0" "$third"
+  fi
+  for p in mysql-server mariadb-server postgresql docker-ce docker.io mongodb-org; do
+    pkg_installed "$p" && pkgs="$pkgs $p"
+  done
+  if [[ -n $pkgs ]]; then
+    printf '  %s!%s services installed:%s — back up their data before upgrading\n' "$c_y" "$c_0" "$pkgs"
+  fi
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    printf '  %s!%s you are connected over SSH: the upgrade opens a spare SSH on port 1022 in case this session drops\n' "$c_y" "$c_0"
+    if [[ -z ${TMUX:-} && -z ${STY:-} ]]; then
+      printf '  %s!%s not inside tmux or screen: run "tmux" first so a dropped connection cannot interrupt the upgrade\n' "$c_y" "$c_0"
+    fi
+  fi
+  printf '  %s!%s take a snapshot or backup of the whole server first (this cannot be undone)\n' "$c_y" "$c_0"
+  return 0
+}
+
+task_release_upgrade() {
+  release_plan
+  if (( RP_BLOCK > 0 )); then
+    warn "Fix the items marked ✘ (or the notes above), then run this again."
+    return 0
+  fi
+
+  if $INTERACTIVE; then
+    echo
+    confirm "I have a fresh backup or snapshot of this server" || { warn "Cancelled — nothing changed."; return 0; }
+    local typed; ask typed "Type UPGRADE to start the upgrade to Ubuntu $R_NEXT" ""
+    [[ $typed == UPGRADE ]] || { warn "Cancelled — nothing changed."; return 0; }
+  elif [[ ${CONFIRM_RELEASE_UPGRADE:-} != yes ]]; then
+    die "Unattended OS upgrades need CONFIRM_RELEASE_UPGRADE=yes (and a backup). Nothing changed."
+  fi
+
+  local target=$R_NEXT
+  step "Bringing Ubuntu ${VERSION_ID} fully up to date first"
+  apt_get update
+  apt_get full-upgrade
+  apt_get autoremove --purge
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "That update needs a reboot first. Run: sudo reboot — then run this again."
+    return 0
+  fi
+
+  step "Preparing the release upgrader"
+  pkg_installed update-manager-core || apt_get install update-manager-core
+  if [[ -f /etc/update-manager/release-upgrades ]]; then
+    backup /etc/update-manager/release-upgrades
+    sed -i 's/^Prompt=.*/Prompt=lts/' /etc/update-manager/release-upgrades
+  fi
+
+  local avail; avail=$(do-release-upgrade -c 2>&1 || true)
+  if grep -qi 'no new release found' <<<"$avail"; then
+    warn "Ubuntu does not offer $target from this system yet:"
+    echo "$avail" | sed 's/^/    /'
+    return 0
+  fi
+  log "Ubuntu offers: $(grep -i 'new release' <<<"$avail" | head -1)"
+
+  local ufw_1022=false
+  if [[ -n ${SSH_CONNECTION:-} ]] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow 1022/tcp comment 'release-upgrade spare ssh' >/dev/null && ufw_1022=true
+    log "Opened port 1022 in UFW for the upgrader's spare SSH."
+  fi
+
+  step "Upgrading to Ubuntu $target (log: /var/log/dist-upgrade/)"
+  if $INTERACTIVE; then
+    # the upgrader asks questions and needs the real terminal, not the log pipe
+    do-release-upgrade </dev/tty >/dev/tty 2>/dev/tty || warn "The upgrader exited with an error; see /var/log/dist-upgrade/."
+  else
+    do-release-upgrade -f DistUpgradeViewNonInteractive || warn "The upgrader exited with an error; see /var/log/dist-upgrade/."
+  fi
+
+  # shellcheck disable=SC1091
+  local now; now=$(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")
+  echo
+  log "System now reports: $now"
+  if $ufw_1022; then log "Remove the spare port when done: sudo ufw delete allow 1022/tcp"; fi
+  cat <<EOF
+
+Next:
+  1. sudo reboot   (if the upgrader did not already)
+  2. Log in again and check your services and databases
+  3. Re-enable any third-party apt sources you use
+  4. Run again for the next step (one LTS at a time):  sudo bash $0 release-info
+  5. Check the result:  sudo bash $0 doctor
+EOF
+  return 0
 }
 
 # =============================================================================
@@ -714,6 +950,11 @@ EOF
 
 run_setup() {
   local level=$1
+  if [[ ${ID:-} == ubuntu ]] && dpkg --compare-versions "${VERSION_ID:-99}" lt 20.04; then
+    warn "Ubuntu ${VERSION_ID} is too old for this setup: its OpenSSH does not understand the hardened SSH settings."
+    warn "Upgrade the OS first:  sudo bash $0 release-upgrade   (plan: release-info)"
+    return 0
+  fi
   probe_state
   collect_setup_input "$level" || return 0
   TS=$(date +%Y%m%d-%H%M%S); BACKUP_DIR="/root/server-setup-backup-$TS"; mkdir -p "$BACKUP_DIR"
@@ -781,9 +1022,18 @@ doctor() {
 
   # ---------------------------------------------------------------- System
   sec "System"
-  local ver=${VERSION_ID:-99}
-  if [[ $ID == ubuntu ]] && dpkg --compare-versions "$ver" lt 22.04; then
-    res WARN "Ubuntu $ver is past standard support" "Upgrade the release (do-release-upgrade) or enable Ubuntu Pro ESM"
+  local ver=${VERSION_ID:-99} today; today=$(date +%F)
+  if [[ $ID == ubuntu ]]; then
+    release_info "$ver"
+    if [[ -z $R_NAME ]]; then
+      res INFO "${PRETTY_NAME:-Ubuntu} is not in the built-in support table; check do-release-upgrade -c"
+    elif [[ $today > $R_STD_END ]]; then
+      res FAIL "Ubuntu $ver standard support ended $R_STD_END (no free security updates)" "Upgrade the OS: sudo bash server-setup.sh release-info  (path: $(release_path_text))"
+    elif [[ $today > $(date -d "$R_STD_END -365 days" +%F) ]]; then
+      res WARN "Ubuntu $ver standard support ends $R_STD_END" "Plan the OS upgrade: sudo bash server-setup.sh release-info"
+    else
+      res PASS "Ubuntu $ver is supported until $R_STD_END"
+    fi
   elif [[ $ID == debian && ${ver%%.*} =~ ^[0-9]+$ ]] && (( ${ver%%.*} < 12 )); then
     res WARN "Debian $ver is past regular support" "Upgrade to Debian 12 or newer"
   else
@@ -1141,7 +1391,8 @@ dashboard() {
   ${c_b}3)${c_0} Essential setup    admin user, key-only SSH, root off, firewall, fail2ban, auto-updates
   ${c_b}4)${c_0} Full setup         essential + kernel/DDoS hardening, swap, log cap, tools
   ${c_b}5)${c_0} Doctor             scan current status and recommend fixes
-  ${c_b}6)${c_0} Show recent log
+  ${c_b}6)${c_0} OS release upgrade scan the upgrade path, benefits and known issues; upgrade Ubuntu
+  ${c_b}7)${c_0} Show recent log
   ${c_b}0)${c_0} Exit
 EOF
   echo
@@ -1158,7 +1409,8 @@ menu() {
       3) run_setup essential; pause ;;
       4) run_setup full; pause ;;
       5) doctor; pause ;;
-      6) tail -n 40 "$LOG_FILE"; pause ;;
+      6) task_release_upgrade; pause ;;
+      7) tail -n 40 "$LOG_FILE"; pause ;;
       0|q|Q|exit) exit 0 ;;
       *) warn "Unknown option: ${choice:-<empty>}"; sleep 1 ;;
     esac
@@ -1171,9 +1423,11 @@ menu() {
 case "${MODE:-}" in
   ""|menu)
     if $INTERACTIVE; then menu; fi
-    usage; die "No terminal available — pass a command (update, upgrade, essential, full, doctor)." ;;
+    usage; die "No terminal available — pass a command (update, upgrade, essential, full, doctor, release-info, release-upgrade)." ;;
   update)          task_update ;;
   upgrade)         task_upgrade ;;
   essential|full)  run_setup "$MODE" ;;
   doctor)          doctor; exit "$DOCTOR_RC" ;;
+  release-info)    release_plan ;;
+  release-upgrade) task_release_upgrade ;;
 esac
