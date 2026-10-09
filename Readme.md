@@ -1,8 +1,24 @@
-# server-setup.sh — Documentation
+# server-setup.sh
 
-Oct 9, 2026 · @Shankar
+**Platforms**
 
-&#91;embedded content: supported platforms, build, security, modes and extras · 5 rows of badges\]
+![Platforms](docs/badges/platforms.svg)
+
+**Build**
+
+![Build](docs/badges/build.svg)
+
+**Security**
+
+![Security](docs/badges/security.svg)
+
+**Modes**
+
+![Modes](docs/badges/modes.svg)
+
+**Safety**
+
+![Safety](docs/badges/safety.svg)
 
 ## What it does
 
@@ -47,7 +63,30 @@ Before closing your root session, open a new terminal and confirm `ssh -p 2222 d
 
 ## How it runs
 
-&#91;embedded content: server-setup.sh execution flow · 9 steps, 3 safety gates\]
+```mermaid
+flowchart TD
+    A["Preflight<br/>checks root and Ubuntu/Debian,<br/>asks for user, SSH key, port, ports"] --> B{"Valid SSH key given?"}
+    B -- no --> X1["Stop: nothing changed<br/>refuses to disable password login"]
+    B -- yes --> C["Steps 1-3: base system and user<br/>upgrade, tools, timezone, swap,<br/>sudo user created, SSH key installed"]
+    C --> D["Step 4: write SSH config<br/>key-only, no root, new port<br/>(not applied yet)"]
+    D --> E{"sshd -t and sshd -T pass?"}
+    E -- no --> X2["Restore SSH backup, stop"]
+    E -- yes --> F["Step 5: lock root password"]
+    F --> G["Step 6: firewall and kernel hardening<br/>UFW, rate-limited SSH, packet filters,<br/>per-IP web limits, SYN-flood sysctl"]
+    G --> H{"Custom UFW rules load?"}
+    H -- no --> W["Fall back to plain UFW<br/>default rules restored, run continues"]
+    H -- yes --> I
+    W --> I["Steps 7-8: Fail2ban and automatic updates"]
+    I --> J["Step 9: restart SSH on the new port<br/>port already open in the firewall"]
+    J --> K["You: test a new login,<br/>then close the root session"]
+
+    classDef stop fill:#fde8e8,stroke:#c0392b,color:#000;
+    classDef warn fill:#fff6e0,stroke:#e6a700,color:#000;
+    classDef live fill:#e3effc,stroke:#2d6fd6,color:#000;
+    class X1,X2 stop;
+    class W warn;
+    class J live;
+```
 
 Essential and Full follow this flow. The red gates stop the run before SSH is changed live, and SSH restarts last, after the firewall already allows the port.
 
