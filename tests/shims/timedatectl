@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "timedatectl $*" >>"${SHIM_LOG:?}"
+[[ $1 == show ]] && echo yes
+exit 0

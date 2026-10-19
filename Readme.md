@@ -1,89 +1,95 @@
-# server-setup.sh
+# server-setup
 
-**Platforms**
+[![CI](https://github.com/shankarThiyagaraajan/linux-server-setup-script/actions/workflows/ci.yml/badge.svg)](https://github.com/shankarThiyagaraajan/linux-server-setup-script/actions/workflows/ci.yml)
 
-![Platforms](docs/badges/platforms.svg)
+One tool to set up, check and look after Ubuntu machines, whether a cloud server, a home server or your own laptop. It opens a dashboard (the **Control Room**) that shows how the machine is doing and what server-setup last did, and every change it makes can be previewed first and undone later.
 
-**Build**
+> **Status:** v3 is in development. This first release covers setup, the security check, updates, history and undo. Alerts, schedules, release upgrades and the personal-computer extras are coming next (they show as "coming soon" in the menu).
 
-![Build](docs/badges/build.svg)
+## Supported systems
 
-**Security**
+- Ubuntu **24.04 LTS** and newer (interim releases run with a warning)
+- Servers, personal computers and WSL. server-setup detects which one it is running on and asks you to confirm.
+- Containers are not supported for setup.
 
-![Security](docs/badges/security.svg)
-
-**Modes**
-
-![Modes](docs/badges/modes.svg)
-
-**Safety**
-
-![Safety](docs/badges/safety.svg)
-
-## What it does
-
-One script for Ubuntu and Debian servers: update the system, harden a fresh server, and check its health. Run it with no arguments for a menu.
-
-## Who it's for
-
-It suits anyone who owns a Linux server and can log in as root over SSH. It is not for people who cannot get a key-based login working, or for systems that are not Debian-based.
-
-| Use it if you are | Do not use it if |
-| --- | --- |
-| Setting up a new Ubuntu or Debian VPS or cloud server | The server runs RHEL, Rocky, Alma, Fedora, Arch or Alpine (they use `dnf`, `firewalld` or other tools) |
-| A developer, indie hacker or small team without a dedicated sysadmin | You have no SSH key, or cannot reach the server any other way (console or provider recovery) if SSH breaks |
-| Running a web app, API, bot or personal server | The server is shared or managed, so you do not have root (shared hosting, managed platforms) |
-| Checking an existing server with `doctor`, which changes nothing | A server already managed by Ansible, Puppet or a hardened corporate image, where this would conflict |
-| Keeping several servers consistent with the same command | A production system with strict change control, unless you test on a copy first |
-
-It is a solid baseline, not a replacement for a full security review, compliance requirements (PCI, HIPAA) or a dedicated security team.
-
-## Quick start
+## Install
 
 ```bash
-sudo bash server-setup.sh           # dashboard menu
-sudo bash server-setup.sh doctor    # health check only
-
-# full hardening, no prompts
-NEW_USER=deploy SSH_PUBKEY="ssh-ed25519 AAAA..." SSH_PORT=2222 \
-ALLOW_PORTS="80/tcp,443/tcp" sudo -E bash server-setup.sh full --yes
+git clone https://github.com/shankarThiyagaraajan/linux-server-setup-script.git
+cd linux-server-setup-script
+make build                 # dist/server-setup + dist/server-setup.sha256
+sudo install -m 755 dist/server-setup /usr/local/sbin/server-setup
+sudo server-setup
 ```
 
-Before closing your root session, open a new terminal and confirm `ssh -p 2222 deploy@<server-ip>` works.
+`dist/server-setup` is one self-contained file, so you can copy it to other machines (check it against `server-setup.sha256`). You can also run `sudo bin/server-setup` straight from the clone.
 
-## Modes
+## Commands
 
 | Command | What it does |
-| --- | --- |
-| `update` | `apt update` and `upgrade`. No settings changed |
-| `upgrade` | `full-upgrade`, cleanup, offers a reboot if needed |
-| `essential` | Sudo user with your key, key-only SSH, root locked, UFW, Fail2ban, automatic updates |
-| `full` | Essential plus kernel and DDoS hardening, web flood limits, swap, log cap, admin tools |
-| `doctor` | Read-only scan: PASS / WARN / FAIL, health score, recommended fixes. Exit code 0 / 1 / 2 |
-| `release-info` | Read-only OS upgrade plan: path (for example 18.04 → 20.04 → 22.04 → 24.04), benefits, known issues, pre-flight checks |
-| `release-upgrade` | Upgrades Ubuntu to the next LTS with `do-release-upgrade`, after a backup confirmation. One step at a time |
+|---|---|
+| `sudo server-setup` | Open the dashboard |
+| `sudo server-setup setup` | Run the setup wizard. If the machine is already set up, it offers changes instead of starting over. |
+| `sudo server-setup confirm` | Keep new SSH settings (run it from a **new** login) |
+| `sudo server-setup check [--json]` | Security check, with exit code 0 (ok), 1 (warnings) or 2 (failures) |
+| `sudo server-setup updates` | Install updates now |
+| `sudo server-setup history` | What server-setup did on this machine, and when |
+| `sudo server-setup rollback RUN_ID [--ssh]` | Put back the files a run changed |
 
-## Do's and Don'ts
+Options: `--dry-run` shows every change as a diff without making it, `--yes --config FILE` runs without questions, `--type server|personal|wsl` skips the machine-type question, and `--no-confirm-timer` is for provisioning tools that verify SSH themselves.
 
-| Do | Don't |
-| --- | --- |
-| Run `doctor` first to see where the server stands | Run setup on a production server without a recent backup or snapshot |
-| Keep your current SSH session open and test a new login in a second terminal before logging out | Close the session you ran the script from until the new login works |
-| Make sure your SSH key works and you have provider console access as a fallback | Run it if you only log in with a password |
-| Open the SSH port in your cloud provider's firewall if you change it | Change the SSH port without checking the provider's firewall allows it |
-| Add your own IP to `FAIL2BAN_IGNOREIP` if you connect from a fixed address | Run many rapid SSH logins from scripts without allowing that IP, or Fail2ban will ban it |
-| Set `WEB_CONN_LIMIT=0` behind Cloudflare or a load balancer | Leave per-IP web limits on when all visitors share a few proxy IPs |
-| Use `update` or `upgrade` regularly, and reboot when `doctor` says so | Ignore pending security updates or reboot warnings |
-| Re-run `doctor` after any change and keep the backup folder until you're sure | Edit `00-hardening.conf` by hand without running `sudo sshd -t` first |
-| Use `ufw allow` for new services, then check with `doctor` | Publish Docker ports on `0.0.0.0` and assume UFW protects them |
+Exit codes: `0` ok, `1` warnings, `2` failures or invalid settings, `3` server-setup itself failed.
 
-## Good to know
+## What setup does on a server
 
-- `update` and `upgrade` never change the Ubuntu version. To move to a newer release (for example from 18.04), use `release-info` then `release-upgrade`. Do this before `essential` or `full`: setup refuses Ubuntu older than 20.04.
-- It needs root and an SSH public key, and refuses to turn off password login without one.
-- Every changed file is backed up to `/root/server-setup-backup-<timestamp>/`; the log is `/var/log/server-setup.log`.
-- If you change the SSH port, open it in your cloud provider's firewall too.
-- Behind Cloudflare or a load balancer, run with `WEB_CONN_LIMIT=0` so real visitors aren't rate-limited.
-- Docker's published ports bypass UFW; bind containers to `127.0.0.1`.
-- Very large DDoS attacks need Cloudflare or your provider's protection; no server setting stops them.
-- Settings are environment variables (`NEW_USER`, `SSH_PUBKEY`, `SSH_PORT`, `ALLOW_PORTS`, `TIMEZONE` and more); see the header of the script.
+- Creates admin accounts with your SSH key and a sudo password, and adds them to `ssh-users`. It refuses to continue if an admin would end up without a key or password.
+- SSH: keys only, no root login, `AllowGroups ssh-users`, modern algorithms, and an optional port change. An existing multi-factor setup is kept.
+- Firewall (UFW): deny incoming by default, a rate-limited SSH rule, your extra ports, and trusted ranges that are never rate-limited.
+- Fail2ban for SSH, including repeat offenders.
+- Automatic security updates, with reboots only if you allow them.
+- Time sync and time zone.
+
+It installs only missing packages. It never upgrades the whole system during setup; that is what `updates` is for.
+
+## The SSH safety net
+
+Changing SSH is how people lock themselves out, so setup never removes your way in until you prove the new way works:
+
+1. When the port changes, SSH listens on **both** the old and new port.
+2. An undo timer starts. If you don't confirm within 10 minutes, the previous SSH configuration is restored automatically.
+3. Open a **new** terminal, log in on the new port, and run `sudo server-setup confirm`. That closes the old port and stops the timer. Confirming from the session you ran setup in is refused, because that session proves nothing.
+
+## Tracking, drift and undo
+
+- `/var/lib/server-setup/state.json` holds what is set up, the last run of each task and the hash of every file server-setup manages. `history.jsonl` holds one line per run. Both are root-only.
+- Every changed file is backed up per run under `/var/lib/server-setup/backups/<RUN_ID>/`, so `rollback` restores it exactly and removes files the run created.
+- If someone edits a managed file by hand, the security check reports it as drift. Setup then asks whether to keep the edit or restore it, and never overwrites the edit silently.
+- Settings are saved to `/etc/server-setup/config.env`, which is parsed and never executed. Keys go in `/etc/server-setup/keys/<user>.pub`.
+
+## Unattended setup
+
+```bash
+openssl passwd -6          # make a password hash for ADMIN_PASSWORD_HASH
+sudo server-setup setup --yes --type server --config examples/config.env
+```
+
+See [examples/config.env](examples/config.env) for every setting. All values are validated, and all problems are reported together before anything changes.
+
+## Optional hardening is your call
+
+Extra measures (disk encryption checks, Secure Boot, screen lock, auditd and similar) will be offered as recommendations with the reason and the trade-off, in a coming release. Nothing optional is applied unless you accept it. The security check already supports this: a recommendation you skip is shown as skipped rather than counted against your score.
+
+## Development
+
+```bash
+make lint      # shellcheck
+make test      # unit tests (bats)
+make build     # dist/server-setup, one self-contained file + sha256
+SS_INTEGRATION=1 bats tests/integration.bats   # THROWAWAY Ubuntu 24.04 container only
+```
+
+The code lives in `bin/server-setup` and `lib/`, and `tools/build.sh` inlines it into one file for release.
+
+## The old scripts
+
+The previous `server-script.sh` is in [legacy/](legacy/) for reference and is no longer maintained. It can lock you out (it replaces `AllowUsers` and changes the SSH port with no way back), so use `server-setup` instead. A machine set up with it is recognised, and its settings are imported the first time you run `server-setup setup`.

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  server-setup: set up, check and look after Ubuntu 24.04+ machines
+#  (servers, personal computers and WSL) from one dashboard.
+#
+#  https://github.com/shankarThiyagaraajan/linux-server-setup-script
+# =============================================================================
+
+# >>> libs (tools/build.sh inlines these into one file)
+SS_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)"
+for _f in core config state files os ui modules/users modules/ssh modules/system checks setup dashboard; do
+  # shellcheck source=/dev/null
+  . "$SS_LIB/$_f.sh"
+done
+unset _f
+# <<< libs
+
+SS_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+usage() {
+  cat <<EOF
+server-setup $SS_VERSION: set up, check and look after Ubuntu 24.04+ machines
+
+Usage: sudo server-setup [command] [options]
+
+Commands
+  (none)            Open the dashboard
+  setup             Set up this server or computer (wizard, or --config/--yes)
+  confirm           Keep the SSH changes (run from a NEW login after setup)
+  check [--json]    Security check. Exit code: 0 ok, 1 warnings, 2 failures
+  updates           Install updates now
+  history           Show what server-setup has done on this machine
+  rollback RUN_ID   Put back the files a run changed (--ssh: only SSH files)
+  version | help
+
+Options
+  -y, --yes             Never prompt; use the saved settings / --config file
+  --config FILE         Settings file (KEY="value" lines, see examples/config.env)
+  --type TYPE           server, personal or wsl (skips the question)
+  --dry-run             Show what would change, change nothing
+  --no-confirm-timer    Don't arm the SSH undo timer (for provisioning tools)
+
+Exit codes: 0 ok · 1 warnings · 2 failures or invalid settings · 3 server-setup itself failed
+EOF
+}
+
+main() {
+  local cmd="" json=false ssh_only=false run_arg=""
+  while (( $# )); do
+    case $1 in
+      -y|--yes)            SS_ASSUME_YES=true ;;
+      --config)            SS_CONFIG_ARG=${2:?--config needs a file}; shift ;;
+      --type)              SS_TYPE_ARG=${2:?--type needs server, personal or wsl}; shift
+                           [[ $SS_TYPE_ARG =~ ^(server|personal|wsl)$ ]] || die "--type must be server, personal or wsl" ;;
+      --dry-run)           SS_DRY_RUN=true ;;
+      --no-confirm-timer)  SS_NO_CONFIRM=true ;;
+      --json)              json=true ;;
+      --ssh)               ssh_only=true ;;
+      -h|--help|help)      usage; exit 0 ;;
+      -V|--version|version) echo "server-setup $SS_VERSION"; exit 0 ;;
+      dashboard|setup|confirm|check|updates|history|rollback)
+                           [[ -z $cmd ]] || die "Only one command at a time."; cmd=$1 ;;
+      *)                   if [[ $cmd == rollback && -z $run_arg ]]; then run_arg=$1; else usage >&2; die "Unknown argument: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n ${SS_CONFIG_ARG:-} && ! -r $SS_CONFIG_ARG ]] && die "Cannot read $SS_CONFIG_ARG"
+  cmd=${cmd:-dashboard}
+
+  ss_init_traps
+  require_root "$cmd"
+  os_load
+  os_require_supported
+  ss_prepare_dirs
+
+  case $cmd in
+    check)
+      cmd_check "$json"; exit "$CHECK_RC" ;;
+    history)
+      history_tail 50 | awk -F'\t' '{printf "%-25s %-10s %-9s %-10s %s\n", $1, $2, $3, $4, $5}' ;;
+    dashboard)
+      ui_interactive || { usage >&2; exit "$EXIT_WARN"; }
+      dashboard ;;
+    setup)
+      ss_lock; ss_log_to_file setup; cmd_setup ;;
+    confirm)
+      ss_lock; ss_log_to_file confirm; cmd_confirm ;;
+    updates)
+      ss_lock; ss_log_to_file updates; task_updates ;;
+    rollback)
+      [[ -n $run_arg ]] || { list_runs_with_backups; die "Give a run id from the list above."; }
+      [[ $run_arg =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || die "Not a run id: $run_arg"
+      ss_lock 300; ss_log_to_file rollback
+      if $ssh_only; then cmd_rollback_ssh "$run_arg"
+      else rollback_run "$run_arg"; history_add rollback ok "undid run $run_arg"; fi ;;
+  esac
+}
+
+main "$@"
