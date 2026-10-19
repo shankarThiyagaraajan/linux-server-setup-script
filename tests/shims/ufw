@@ -1,0 +1,17 @@
+#!/bin/bash
+# Test double: keeps rules in $SHIM_DIR/ufw.rules and prints a ufw-like status.
+echo "ufw $*" >>"${SHIM_LOG:?}"
+r="$SHIM_DIR/ufw.rules"; touch "$r"
+case "$1" in
+  --force) [[ $2 == enable ]] && touch "$SHIM_DIR/ufw.on" ;;
+  allow|limit)
+    if [[ $2 == from ]]; then exit 0; fi
+    spec=$2; act=${1^^}; grep -q "^$spec " "$r" || printf '%s %s\n' "$spec" "$act" >>"$r" ;;
+  delete) sed -i "\|^$3 |d" "$r" ;;
+  status)
+    if [[ -f "$SHIM_DIR/ufw.on" ]]; then echo "Status: active"; else echo "Status: inactive"; exit 0; fi
+    [[ $2 == verbose ]] && echo "Default: deny (incoming), allow (outgoing), deny (routed)"
+    echo; echo "To                         Action      From"; echo "--                         ------      ----"
+    while read -r s a; do printf '%-26s %-11s Anywhere\n' "$s" "$a"; done <"$r" ;;
+esac
+exit 0

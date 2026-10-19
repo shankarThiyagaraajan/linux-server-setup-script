@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck bats openssh-server
+      - name: Lint
+        run: make lint
+      - name: Unit tests
+        run: make test
+      - name: Build single-file release
+        run: make build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-setup
+          path: dist/
+
+  integration:
+    # Creates users and rewrites /etc/ssh, so it only runs in a throwaway container.
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends make git bats openssl python3 \
+            openssh-server openssh-client ufw fail2ban python3-systemd unattended-upgrades \
+            iproute2 systemd-timesyncd adduser passwd sudo
+      - name: Build
+        run: git config --global --add safe.directory "$PWD" && make build
+      - name: Setup, confirm and rollback (source tree)
+        run: SS_INTEGRATION=1 bats tests/integration.bats
+      - name: Reset the container
+        run: |
+          userdel -r opsadmin || true
+          rm -f /etc/ssh/sshd_config.d/00-server-setup.conf
+          passwd -u root || true
+      - name: Setup, confirm and rollback (bundled file)
+        run: SS_INTEGRATION=1 SS_BIN=$PWD/dist/server-setup bats tests/integration.bats

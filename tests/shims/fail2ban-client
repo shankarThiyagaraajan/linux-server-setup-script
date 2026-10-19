@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "fail2ban-client $*" >>"${SHIM_LOG:?}"
+exit 0
