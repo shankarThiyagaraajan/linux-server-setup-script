@@ -77,8 +77,8 @@ wizard_profile() {
 
 wizard_components() {
   local all names=() i c on items=() desc
-  if [[ ${CFG[MACHINE_TYPE]} == server ]]; then all="ssh firewall fail2ban autoupdates timesync watch"
-  else all="firewall autoupdates timesync watch ssh fail2ban"; fi
+  if [[ ${CFG[MACHINE_TYPE]} == server ]]; then all="ssh firewall fail2ban autoupdates timesync watch schedule"
+  else all="firewall autoupdates timesync watch schedule ssh fail2ban"; fi
   declare -A desc=(
     [ssh]="SSH|keys only, no root login, limited to the ssh-users group"
     [firewall]="Firewall|block incoming connections except the ones you allow"
@@ -86,6 +86,7 @@ wizard_components() {
     [autoupdates]="Automatic updates|install security updates every day"
     [timesync]="Clock sync|keep the clock correct (needed for logs and TLS)"
     [watch]="Security watch|alert on suspicious logins, new admins, key and config changes"
+    [schedule]="Scheduled maintenance|daily check, weekly updates and clean-up, monthly review"
   )
   for c in $all; do
     on=off; cfg_has "$c" && on=on
@@ -234,6 +235,7 @@ apply_all() {
   cfg_has autoupdates && apply_autoupdates
   cfg_has timesync && apply_timesync
   cfg_has watch && apply_watch
+  cfg_has schedule && apply_schedule
   [[ -n ${CFG[RECOMMENDATIONS]} ]] && apply_recommendations
   [[ ${CFG[MACHINE_TYPE]} == server ]] && apply_root_lock
   cfg_has ssh && ssh_restart
@@ -300,7 +302,7 @@ setup_changes_lines() {
   if command -v ufw >/dev/null 2>&1; then
     for p in $(fw_unmanaged_ports); do printf '%s! %sPort %s was opened outside server-setup\n' "$C_AMBER" "$C_0" "$p"; done
   fi
-  for c in ssh firewall fail2ban autoupdates timesync; do cfg_has "$c" || comps+=("$c"); done
+  for c in ssh firewall fail2ban autoupdates timesync watch schedule; do cfg_has "$c" || comps+=("$c"); done
   (( ${#comps[@]} )) && printf '%s· %sNot set up: %s\n' "$C_DIM" "$C_0" "${comps[*]}"
   return 0
 }

@@ -117,6 +117,14 @@ run_checks() {
   return 0
 }
 
+check_fail_ids() { local r st id; for r in "${CHK_RESULTS[@]}"; do IFS=$'\t' read -r st id _ <<<"$r"; [[ $st == FAIL ]] && echo "$id"; done; return 0; }
+# check_save: remember the result (the daily job compares with it).
+check_save() {
+  [[ $EUID -eq 0 ]] || return 0
+  # shellcheck disable=SC2046
+  state_set last_check "{\"score\": $CHK_SCORE, \"pass\": $CHK_PASS, \"warn\": $CHK_WARN, \"fail\": $CHK_FAIL, \"fail_ids\": $(json_list $(check_fail_ids))}"
+}
+
 # check_rc: 0 all good, 1 warnings, 2 failures.
 check_rc() { (( CHK_FAIL > 0 )) && return 2; (( CHK_WARN > 0 )) && return 1; return 0; }
 
@@ -150,7 +158,7 @@ cmd_check() {
   if [[ $json == true ]]; then checks_json; else step "Security check"; print_checks; fi
   check_rc || rc=$?
   if [[ $EUID -eq 0 ]]; then
-    state_set last_check "{\"score\": $CHK_SCORE, \"pass\": $CHK_PASS, \"warn\": $CHK_WARN, \"fail\": $CHK_FAIL}"
+    check_save
     history_add check "$( ((rc == 0)) && echo ok || echo attention)" "score $CHK_SCORE · $CHK_WARN warn · $CHK_FAIL fail"
   fi
   CHECK_RC=$rc

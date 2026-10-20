@@ -8,7 +8,7 @@
 
 # >>> libs (tools/build.sh inlines these into one file)
 SS_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)"
-for _f in core config state files os ui modules/users modules/ssh modules/system modules/release modules/watch modules/recommend checks setup dashboard; do
+for _f in core config state files os ui modules/users modules/ssh modules/system modules/release modules/watch modules/alerts modules/schedule modules/recommend checks setup dashboard; do
   # shellcheck source=/dev/null
   . "$SS_LIB/$_f.sh"
 done
@@ -32,6 +32,9 @@ Commands
   history           Show what server-setup has done on this machine
   rollback RUN_ID   Put back the files a run changed (--ssh: only SSH files)
   events [--json]   Security events found by the watch (newest first)
+  maintain JOB      Run a maintenance job now: daily, weekly or monthly
+                    (the timers run these; see the dashboard's Schedule)
+  alert-test        Send a test alert to every channel that is set up
   recommendations [--json]
                     Optional hardening for this machine and what you decided
   watch [--once]    Run the security watch (the systemd service runs this)
@@ -67,9 +70,9 @@ main() {
       --once)              once=true ;;
       -h|--help|help)      usage; exit 0 ;;
       -V|--version|version) echo "server-setup $SS_VERSION"; exit 0 ;;
-      dashboard|setup|confirm|check|updates|history|rollback|release-upgrade|__release-run|watch|events|recommendations)
+      dashboard|setup|confirm|check|updates|history|rollback|release-upgrade|__release-run|watch|events|recommendations|maintain|alert-test)
                            [[ -z $cmd ]] || die "Only one command at a time."; cmd=$1 ;;
-      *)                   if [[ $cmd == rollback && -z $run_arg ]]; then run_arg=$1; else usage >&2; die "Unknown argument: $1"; fi ;;
+      *)                   if [[ $cmd =~ ^(rollback|maintain)$ && -z $run_arg ]]; then run_arg=$1; else usage >&2; die "Unknown argument: $1"; fi ;;
     esac
     shift
   done
@@ -109,6 +112,12 @@ main() {
       else _watch_py list 50 | awk -F'\x1f' '{printf "%-25s %-9s %-4s %s\n", $2, $3, ($5=="no" ? "NEW" : ""), $8}'; fi ;;
     recommendations)
       cmd_recommendations "$json" ;;
+    maintain)
+      [[ $run_arg =~ ^(daily|weekly|monthly)$ ]] || die "maintain needs daily, weekly or monthly"
+      ss_lock 1800; ss_log_to_file "maintain $run_arg"; cmd_maintain "$run_arg"
+      [[ $MAINT_RESULT == ok ]] || exit "$EXIT_WARN" ;;
+    alert-test)
+      cmd_alert_test; exit "$CHECK_RC" ;;
     rollback)
       [[ -n $run_arg ]] || { list_runs_with_backups; die "Give a run id from the list above."; }
       [[ $run_arg =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || die "Not a run id: $run_arg"

@@ -8,13 +8,15 @@ setup_file() {
   [[ ${SS_INTEGRATION:-} == 1 ]] || skip "set SS_INTEGRATION=1 (destructive: use a throwaway container)"
   export T=$(mktemp -d)
   export SS_STATE_DIR=$T/state SS_CONF_DIR=$T/conf SS_LOG=$T/log
-  export SHIM_DIR=$T/shim SHIM_LOG=$T/shim.log SS_PATH_PREFIX=$BATS_TEST_DIRNAME/shims
+  export SHIM_DIR=$T/shim SHIM_LOG=$T/shim.log SS_PATH_PREFIX=$BATS_TEST_DIRNAME/shims SS_MAINT_BACKUP_DIR=$T/maint
   mkdir -p "$SHIM_DIR"; : >"$SHIM_LOG"
   ssh-keygen -A >/dev/null
   ssh-keygen -q -t ed25519 -N '' -f "$T/id" >/dev/null
   cat >"$T/server.env" <<CFG
 PROFILE="web"
-COMPONENTS="ssh firewall fail2ban autoupdates timesync watch"
+COMPONENTS="ssh firewall fail2ban autoupdates timesync watch schedule"
+MAINT_UPDATES="none"
+RECOMMENDATIONS="REC-PWQUALITY"
 ADMIN_USERS="opsadmin"
 ADMIN_PUBKEY="$T/id.pub"
 ADMIN_PASSWORD_HASH='$(openssl passwd -6 'correct horse battery')'
@@ -42,6 +44,9 @@ ss() { "${SS_BIN:-$BATS_TEST_DIRNAME/../bin/server-setup}" "$@"; }
   grep -qx 'ProtectSystem=strict' /etc/systemd/system/server-setup-watch.service
   grep -q 'systemctl restart server-setup-watch' "$SHIM_LOG"
   [ -x /etc/update-motd.d/60-server-setup ]
+  grep -qx 'Persistent=true' /etc/systemd/system/server-setup-weekly.timer
+  grep -q 'systemctl enable --now server-setup-daily.timer' "$SHIM_LOG"
+  grep -qx 'minlen = 14' /etc/security/pwquality.conf.d/50-server-setup.conf
   grep -qF "$(cut -d' ' -f2 "$T/id.pub")" /home/opsadmin/.ssh/authorized_keys
   [ "$(passwd -S opsadmin | awk '{print $2}')" = P ]
   [ "$(passwd -S root | awk '{print $2}')" = L ]
@@ -114,4 +119,20 @@ ss() { "${SS_BIN:-$BATS_TEST_DIRNAME/../bin/server-setup}" "$@"; }
   echo "$output"
   [ "$status" -eq 0 ]
   python3 -c 'import json,sys; json.loads(sys.stdin.read())' <<<"$output"
+}
+
+@test "recommendations list what was applied" {
+  run ss recommendations --json
+  echo "$output"
+  [ "$status" -eq 0 ]
+  python3 -c 'import json,sys; r={x["id"]: x for x in json.loads(sys.stdin.read())}; assert r["REC-PWQUALITY"]["status"] == "in-place", r' <<<"$output"
+}
+
+@test "the weekly job saves a settings backup and records the run" {
+  run ss maintain weekly
+  echo "$output"
+  [ "$status" -eq 0 ]
+  ls "$T/maint"/settings-*.tar.gz
+  tar -tzf "$(ls "$T/maint"/settings-*.tar.gz | head -1)" | grep -q 'conf/config.env$'
+  grep -q '"task": "maintain-weekly"' "$SS_STATE_DIR/history.jsonl"
 }

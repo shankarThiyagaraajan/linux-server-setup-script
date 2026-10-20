@@ -8,7 +8,7 @@
 declare -gA CFG_DEFAULTS=(
   [MACHINE_TYPE]=""            # server | personal | wsl
   [PROFILE]="base"             # base | web | custom
-  [COMPONENTS]="ssh firewall fail2ban autoupdates timesync watch"
+  [COMPONENTS]="ssh firewall fail2ban autoupdates timesync watch schedule"
   [ADMIN_USERS]=""             # space-separated; first one is the primary admin
   [ADMIN_PUBKEY]=""            # key text or file, for the first admin (unattended)
   [ADMIN_PASSWORD_HASH]=""     # crypt hash (openssl passwd -6), for unattended runs
@@ -21,6 +21,11 @@ declare -gA CFG_DEFAULTS=(
   [AUTO_REBOOT]="false"
   [REBOOT_TIME]="04:00"
   [TIMEZONE]=""                # blank = keep the current timezone
+  [MAINT_DAILY]="true"         # scheduled maintenance (component "schedule")
+  [MAINT_WEEKLY]="true"
+  [MAINT_MONTHLY]="true"
+  [MAINT_UPDATES]="security"   # weekly job installs: security | all | none
+  [MAINT_BACKUPS_KEEP]="8"     # weekly settings backups to keep
   [RECOMMENDATIONS]=""         # optional hardening to apply, e.g. "REC-SYSCTL REC-AUDITD"
 )
 
@@ -107,7 +112,7 @@ cfg_validate() {
   [[ ${CFG[MACHINE_TYPE]} =~ ^(server|personal|wsl)$ ]] || errs+=("MACHINE_TYPE must be server, personal or wsl")
   [[ ${CFG[PROFILE]} =~ ^(base|web|custom)$ ]] || errs+=("PROFILE must be base, web or custom")
   for c in ${CFG[COMPONENTS]}; do
-    [[ $c =~ ^(ssh|firewall|fail2ban|autoupdates|timesync|watch)$ ]] || errs+=("unknown component: $c")
+    [[ $c =~ ^(ssh|firewall|fail2ban|autoupdates|timesync|watch|schedule)$ ]] || errs+=("unknown component: $c")
   done
   for c in ${CFG[RECOMMENDATIONS]}; do
     [[ -v "REC_TITLE[$c]" ]] || errs+=("unknown recommendation: $c (see: server-setup recommendations)")
@@ -122,6 +127,9 @@ cfg_validate() {
   [[ ${CFG[SSH_FORWARDING]} =~ ^(no|local|yes)$ ]] || errs+=("SSH_FORWARDING must be no, local or yes")
   for p in ${CFG[OPEN_PORTS]}; do valid_portspec "$p" || errs+=("invalid port: $p (use 80/tcp or 6000:6007/udp)"); done
   for p in ${CFG[TRUSTED_CIDRS]}; do valid_cidr "$p" || errs+=("invalid IP or CIDR: $p"); done
+  for c in MAINT_DAILY MAINT_WEEKLY MAINT_MONTHLY; do valid_bool "${CFG[$c]}" || errs+=("$c must be true or false"); done
+  [[ ${CFG[MAINT_UPDATES]} =~ ^(security|all|none)$ ]] || errs+=("MAINT_UPDATES must be security, all or none")
+  [[ ${CFG[MAINT_BACKUPS_KEEP]} =~ ^[1-9][0-9]{0,2}$ ]] || errs+=("MAINT_BACKUPS_KEEP must be a number from 1 to 999")
   valid_bool "${CFG[AUTO_REBOOT]}" || errs+=("AUTO_REBOOT must be true or false")
   valid_bool "${CFG[ALLOW_NOPASSWD_SUDO]}" || errs+=("ALLOW_NOPASSWD_SUDO must be true or false")
   valid_time "${CFG[REBOOT_TIME]}" || errs+=("REBOOT_TIME must be HH:MM")

@@ -24,11 +24,12 @@ WATCH_MOTD=${SS_WATCH_MOTD:-/etc/update-motd.d/60-server-setup}
 
 _watch_py() {
   python3 -I - "$SS_STATE_DIR" "$SS_CONF_DIR" "$@" <<'PY'
-import fcntl, glob, hashlib, ipaddress, json, os, pwd, re, select, subprocess, sys, time
+import fcntl, glob, hashlib, ipaddress, json, os, pwd, re, select, socket, subprocess, sys, time, urllib.request
 
 state_dir, conf_dir, mode, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 P = lambda n: os.path.join(state_dir, n)
 WF, EV, ST, BANNER, LOCK, WLOCK = P("watch.json"), P("events.jsonl"), P("state.json"), P("watch-banner"), P("lock"), P("watch.lock")
+INBOX = P("events-inbox.jsonl")
 START = time.time()
 
 def iso(t): return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
@@ -45,7 +46,7 @@ def save(p, obj):
     os.replace(tmp, p)
 
 W = load(WF, {})
-for k, v in (("seq", 0), ("known", {}), ("fails", []), ("alerted", {}), ("stats", {}), ("snap", {})):
+for k, v in (("seq", 0), ("known", {}), ("fails", []), ("alerted", {}), ("stats", {}), ("snap", {}), ("outbox", []), ("alert_last", {})):
     W.setdefault(k, v)
 FIRST = W.get("cursor") is None and W.get("hashes") is None   # learning run
 NEW = []
@@ -78,10 +79,10 @@ def setup_running():
     except OSError: return True
     finally: os.close(fd)
 
-def emit(sev, kind, msg, t=None, **kw):
+def emit(sev, kind, msg, t=None, own=False, **kw):
     t = t or time.time()
     if FIRST and t < START: sev = "info"                      # learning: no alarms for the past
-    elif sev != "critical" and setup_running():
+    elif sev != "critical" and not own and setup_running():
         sev, msg = "info", msg + " (while server-setup was making changes)"
     W["seq"] += 1
     ev = {"id": W["seq"], "time": iso(t), "sev": sev, "kind": kind, "msg": msg}
@@ -93,6 +94,144 @@ def once_per_day(key):
     if W["alerted"].get(key) == day: return False
     W["alerted"][key] = day
     return True
+
+# ---------------------------------------------------------------- alerts
+# Settings: $SS_CONF_DIR/alerts.env (KEY="value", parsed here, never sourced).
+# Messages are sent from this process, so tokens never appear in a command line.
+LEVELS = {"info": 0, "important": 1, "critical": 2}
+def alert_conf():
+    c = {}
+    try:
+        for line in open(os.path.join(conf_dir, "alerts.env")):
+            m = re.match(r"""^([A-Z_]+)=["']?(.*?)["']?$""", line.strip())
+            if m: c[m.group(1)] = m.group(2)
+    except OSError: pass
+    return c
+A = alert_conf()
+HOST = socket.gethostname()
+
+def channels():
+    out = []
+    if A.get("ALERT_NTFY_URL"): out.append("ntfy")
+    if A.get("ALERT_WEBHOOK_URL"): out.append("webhook")
+    if A.get("ALERT_SLACK_WEBHOOK"): out.append("slack")
+    if A.get("ALERT_TELEGRAM_TOKEN") and A.get("ALERT_TELEGRAM_CHAT"): out.append("telegram")
+    if A.get("ALERT_EMAIL_TO"): out.append("email")
+    return out
+
+def post(url, data, headers):
+    if not url.startswith("https://") and os.environ.get("SS_ALERT_ALLOW_HTTP") != "1":
+        raise ValueError("only https:// addresses are allowed")
+    req = urllib.request.Request(url, data=data, headers=dict(headers, **{"User-Agent": "server-setup"}), method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r: r.read(2000)
+
+def send(ch, title, text, sev, extra):
+    if ch == "ntfy":
+        h = {"Title": title, "Priority": {"critical": "5", "important": "4"}.get(sev, "3"),
+             "Tags": {"critical": "rotating_light", "important": "warning"}.get(sev, "information_source")}
+        if A.get("ALERT_NTFY_TOKEN"): h["Authorization"] = "Bearer " + A["ALERT_NTFY_TOKEN"]
+        post(A["ALERT_NTFY_URL"], text.encode(), h)
+    elif ch == "webhook":
+        post(A["ALERT_WEBHOOK_URL"], json.dumps(dict(extra, host=HOST, severity=sev, title=title, text=text)).encode(), {"Content-Type": "application/json"})
+    elif ch == "slack":
+        post(A["ALERT_SLACK_WEBHOOK"], json.dumps({"text": f"*{title}*\n{text}"}).encode(), {"Content-Type": "application/json"})
+    elif ch == "telegram":
+        api = os.environ.get("SS_TELEGRAM_API", "https://api.telegram.org")
+        post(f"{api}/bot{A['ALERT_TELEGRAM_TOKEN']}/sendMessage",
+             json.dumps({"chat_id": A["ALERT_TELEGRAM_CHAT"], "text": f"{title}\n{text}", "disable_web_page_preview": True}).encode(),
+             {"Content-Type": "application/json"})
+    elif ch == "email":
+        msg = f"To: {A['ALERT_EMAIL_TO']}\nSubject: {title}\nContent-Type: text/plain; charset=utf-8\n\n{text}\n"
+        r = subprocess.run(["msmtp", "-t"], input=msg, text=True, capture_output=True, timeout=30)
+        if r.returncode: raise OSError((r.stderr or "msmtp failed").strip()[:200])
+
+def queue_alerts(evs):
+    chs = channels()
+    if not chs: return
+    lvl = LEVELS.get(A.get("ALERT_MIN_LEVEL", "important"), 1)
+    pick = [e for e in evs if e.get("notify") or LEVELS.get(e["sev"], 0) >= lvl]
+    if not pick: return
+    review = "\nReview in the dashboard: sudo server-setup"
+    if len(pick) > 5:      # a burst becomes one message, not a flood
+        worst = max(pick, key=lambda e: LEVELS.get(e["sev"], 0))["sev"]
+        text = "\n".join(f"- [{e['sev']}] {e['msg']}" for e in pick[:10]) + (f"\n...and {len(pick) - 10} more" if len(pick) > 10 else "")
+        items = [(f"server-setup {HOST}: {len(pick)} events", text + review, worst, {"ids": [e["id"] for e in pick]})]
+    else:
+        items = [(f"server-setup {HOST}: {e.get('title') or e['sev']}", e["msg"] + (review if e["sev"] != "info" else ""), e["sev"],
+                  {"id": e["id"], "kind": e["kind"], "time": e["time"], "message": e["msg"]}) for e in pick]
+    for ch in chs:
+        for title, text, sev, extra in items:
+            W["outbox"].append({"ch": ch, "title": title, "text": text, "sev": sev, "extra": extra, "tries": 0, "next": 0, "since": time.time()})
+    del W["outbox"][:-500]
+
+def deliver():
+    now, keep, chs = time.time(), [], channels()
+    for m in W["outbox"]:
+        if m["ch"] not in chs: continue                       # channel was removed
+        if m["next"] > now: keep.append(m); continue
+        try:
+            send(m["ch"], m["title"], m["text"], m["sev"], m["extra"])
+            W["alert_last"][m["ch"]] = {"time": iso(now), "ok": True}
+        except Exception as ex:                               # retried with back-off for a day
+            m["tries"] += 1; m["next"] = now + min(60 * 2 ** m["tries"], 3600); m["error"] = str(ex)[:200]
+            W["alert_last"][m["ch"]] = {"time": iso(now), "ok": False, "error": m["error"]}
+            if now - m["since"] < 86400: keep.append(m)
+            elif once_per_day("alert-failed:" + m["ch"]):
+                emit("important", "alert-failed", f"Alerts to {m['ch']} have failed for a day: {m['error']}", own=True)
+    W["outbox"] = keep
+
+def ingest_inbox():
+    """Events raised by server-setup itself (maintenance, reports) arrive here."""
+    work = INBOX + ".work"
+    if not os.path.exists(work):
+        try: os.rename(INBOX, work)
+        except OSError: return
+    try:
+        with open(work) as fh: lines = fh.read().splitlines()
+    except OSError: return
+    for l in lines:
+        try: e = json.loads(l)
+        except ValueError: continue
+        if e.get("sev") in LEVELS and e.get("msg"):
+            emit(e["sev"], str(e.get("kind", "server-setup")), str(e["msg"]), own=True, notify=bool(e.get("notify")), title=e.get("title"))
+    os.remove(work)
+
+# ---------------------------------------------------------------- health
+def health_probe():
+    if os.environ.get("SS_HEALTH_PROBE") is not None:
+        return load(os.environ["SS_HEALTH_PROBE"], {})
+    h = {"disk": {}, "inodes": {}, "failed": []}
+    for mnt in ("/", "/boot", "/var", "/home"):
+        if mnt != "/" and not os.path.ismount(mnt): continue
+        try: s = os.statvfs(mnt)
+        except OSError: continue
+        if s.f_blocks: h["disk"][mnt] = round(100 * (1 - s.f_bavail / s.f_blocks))
+        if s.f_files: h["inodes"][mnt] = round(100 * (1 - s.f_favail / s.f_files))
+    try:
+        mi = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo")}
+        h["mem_avail"] = round(100 * mi["MemAvailable"] / mi["MemTotal"])
+    except (OSError, KeyError, ValueError, ZeroDivisionError): pass
+    try:
+        out = subprocess.run(["systemctl", "--failed", "--no-legend", "--plain"], capture_output=True, text=True, timeout=20).stdout
+        h["failed"] = [l.split()[0] for l in out.splitlines() if l.strip()]
+    except (OSError, subprocess.SubprocessError): pass
+    return h
+
+def check_health():
+    if A.get("ALERT_HEALTH", "true") == "false": return
+    h, probs = health_probe(), {}
+    for m, p in h.get("disk", {}).items():
+        if p >= 90: probs["disk:" + m] = ("critical" if p >= 97 else "important", f"Disk {m} is {p}% full")
+    for m, p in h.get("inodes", {}).items():
+        if p >= 90: probs["inodes:" + m] = ("important", f"Disk {m} is running out of inodes ({p}% used)")
+    if h.get("mem_avail", 100) <= 5: probs["mem"] = ("important", f"Memory is almost full ({h['mem_avail']}% available)")
+    for u in h.get("failed", []): probs["unit:" + u] = ("important", f"Service {u} has failed")
+    seen = W.get("health", {})
+    for k, (sev, msg) in sorted(probs.items()):              # once per problem, again only after it recovers
+        if k not in seen: emit(sev, "health", msg, own=True)
+    for k in sorted(set(seen) - set(probs)):
+        emit("info", "health-ok", f"Back to normal: {seen[k]}", own=True)
+    W["health"] = {k: v[1] for k, v in probs.items()}
 
 # ---------------------------------------------------------------- journal
 SSH_IDS = {"sshd", "sshd-session", "sshd-auth"}
@@ -298,7 +437,7 @@ def check_ports():
     W["ports"] = cur
 
 def periodic():
-    check_files(); check_ports()
+    check_files(); check_ports(); check_health()
     W["fails"] = [f for f in W["fails"] if time.time() - f[0] < 86400][-20000:]
     W["last_check"] = iso(time.time())
 
@@ -316,6 +455,9 @@ def unreviewed():
     return out
 
 def flush():
+    ingest_inbox()
+    queue_alerts(NEW)
+    deliver()
     if NEW:
         fd = os.open(EV, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as fh:
@@ -403,6 +545,20 @@ elif mode == "list":      # id time sev kind reviewed ip user msg, separated by 
 
 elif mode == "banner":
     write_banner()
+
+elif mode == "alert-test":                                     # channel<TAB>ok|error, sent right now
+    if not channels(): sys.exit(1)
+    for ch in channels():
+        try:
+            send(ch, f"server-setup {HOST}: test", "This is a test alert from server-setup. Alerts work.", "info", {"kind": "test"})
+            print(f"{ch}\tok")
+        except Exception as ex: print(f"{ch}\t{str(ex)[:200]}")
+
+elif mode == "alert-status":                                   # channel<TAB>time<TAB>ok<TAB>error, then pending<TAB>n
+    for ch in channels():
+        l = W["alert_last"].get(ch, {})
+        print(f"{ch}\t{l.get('time', '')}\t{'yes' if l.get('ok') else ('no' if l else '')}\t{l.get('error', '')}")
+    print(f"pending\t{len(W['outbox'])}")
 else:
     sys.exit("unknown watch mode: " + mode)
 PY
@@ -477,7 +633,7 @@ event_popup() {
   line=$(event_get "$1"); [[ -n $line ]] || return 0
   IFS=$'\x1f' read -r id time sev kind rev ip user msg <<<"$line"
   case $sev in critical) color=$C_RED ;; important) color=$C_AMBER ;; *) color=$C_CYAN ;; esac
-  local body=("${C_BOLD}$msg${C_0}" "" "When: $(date -d "$time" '+%a %-d %b %H:%M' 2>/dev/null || echo "$time")")
+  local body=("$msg" "" "When: $(date -d "$time" '+%a %-d %b %H:%M' 2>/dev/null || echo "$time")")
   [[ -n $ip ]] && body+=("From: $ip$( [[ -n ${SSH_CONNECTION:-} && $ip == "${SSH_CONNECTION%% *}" ]] && echo "  (that is you, right now)" || true)")
   [[ -n $user ]] && body+=("Account: $user")
   body+=("" "$(event_advice "$kind")")
@@ -517,6 +673,11 @@ event_advice() {
     sudoers|sshd-config|cron|service|file) echo "If you or a package update did not change this, compare it with a backup." ;;
     new-port) echo "A program started accepting connections. If you don't know it, find it: Open ports panel." ;;
     oom) echo "The machine ran out of memory. Add swap or memory, or limit the program." ;;
+    health) echo "Disk: Install updates (3) also cleans up; journals and old kernels are the usual culprits. Failed service: systemctl status NAME." ;;
+    score-drop) echo "Run the security check (2) to see what changed and how to fix it." ;;
+    stale-admin) echo "Unused admin accounts are an easy way in. Lock the ones nobody needs under Users & SSH keys (4)." ;;
+    alert-failed) echo "Check the channel under Alerts (6) and send a test." ;;
+    new-release) echo "Upgrade Ubuntu (8) checks the machine is ready before it starts." ;;
     *) echo "" ;;
   esac
 }

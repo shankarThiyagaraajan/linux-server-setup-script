@@ -3,7 +3,7 @@ load helper
 
 setup() {
   load_libs
-  export SS_WATCH_FILES="$T/files/*" SS_PROBE_PORTS=$T/ports SS_JOURNAL_CMD="cat $T/journal"
+  export SS_WATCH_FILES="$T/files/*" SS_PROBE_PORTS=$T/ports SS_JOURNAL_CMD="cat $T/journal" SS_HEALTH_PROBE=$T/health
   mkdir -p "$T/files"; : >"$T/ports"; : >"$T/journal"
   echo '{"cursor": "c0", "hashes": {}, "ports": {}}' >"$SS_STATE_DIR/watch.json"   # past the learning run
   printf 'TRUSTED_CIDRS="198.51.100.0/24"\n' >"$SS_CONF_DIR/config.env"
