@@ -249,7 +249,7 @@ rel_rerender_ssh() {
 # Progress: the phase the upgrade is in, from its log.
 REL_PHASES=("Preparing" "Downloading" "Installing" "Cleaning up" "Checking access" "Done")
 rel_phase() {
-  local f=${1:-$REL_LOG} p=0
+  local f=$REL_LOG p=0
   [[ -s $f ]] || { echo 0; return; }
   if grep -q '^==> do-release-upgrade finished' "$f"; then p=4
     grep -q 'Checking that you can still log in' "$f" && p=4
