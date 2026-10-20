@@ -120,7 +120,6 @@ run_checks() {
 check_fail_ids() { local r st id; for r in "${CHK_RESULTS[@]}"; do IFS=$'\t' read -r st id _ <<<"$r"; [[ $st == FAIL ]] && echo "$id"; done; return 0; }
 # check_save: remember the result (the daily job compares with it).
 check_save() {
-  [[ $EUID -eq 0 ]] || return 0
   # shellcheck disable=SC2046
   state_set last_check "{\"score\": $CHK_SCORE, \"pass\": $CHK_PASS, \"warn\": $CHK_WARN, \"fail\": $CHK_FAIL, \"fail_ids\": $(json_list $(check_fail_ids))}"
 }
