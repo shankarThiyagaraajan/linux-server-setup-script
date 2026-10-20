@@ -179,6 +179,11 @@ panel_machine() {
     left=$(( pend + CONFIRM_MINUTES * 60 - $(date +%s) ))
     (( left > 0 )) && rows+=("$(lr "${C_AMBER}Undo timer${C_0}" "${C_AMBER}$((left / 60))m $((left % 60))s left${C_0}")")
   fi
+  case $(state_get release_upgrade.status) in
+    running)   rows+=("$(lr "${C_CYAN}Upgrade${C_0}" "${C_CYAN}running · press 8${C_0}")") ;;
+    ready)     rows+=("$(lr "${C_GREEN}Upgrade${C_0}" "${C_GREEN}restart to finish · 8${C_0}")") ;;
+    attention|failed) rows+=("$(lr "${C_RED}Upgrade${C_0}" "${C_RED}needs attention · 8${C_0}")") ;;
+  esac
   rows+=("$(lr "Reboot needed" "$( [[ -f /var/run/reboot-required ]] && echo "${C_AMBER}yes${C_0}" || echo "${C_GREEN}no${C_0}")")")
   panel "This machine" "$1" "${rows[@]}"
 }
@@ -196,7 +201,7 @@ menu_items() {
 # Screens that arrive in later updates are shown dimmed.
 menu_ready() {
   case "$D_TYPE:$1" in
-    *:1|*:2|*:3|*:5|*:h|*:q|server:4) return 0 ;;
+    *:1|*:2|*:3|*:5|*:8|*:h|*:q|server:4) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -313,22 +318,38 @@ screen_history() {
   ui_pause
 }
 
+# dash_lock: like ss_lock, but when another task holds the lock it says so in a
+# pop-up and returns 1, so the dashboard stays open.
+dash_lock() {
+  exec 9>"$SS_STATE_DIR/lock"
+  flock -n 9 && return 0
+  local what="Another server-setup task"
+  rel_running && what="The Ubuntu upgrade"
+  systemctl is-active --quiet "$CONFIRM_UNIT" 2>/dev/null && what="The SSH undo timer"
+  ui_clear
+  UI_POPUP_NOTE='' ui_popup "$C_AMBER" "Busy" "$what is changing this machine right now." \
+    "Try again when it finishes. Everything else on the dashboard still works." -- "OK|"
+  return 1
+}
+
 dashboard() {
   local key
   trap 'ui_show_cursor' EXIT
+  rel_welcome_popup
   while true; do
     dash_draw
     key=$(ui_key)
     # The lock is held only while something changes, so the SSH undo timer
     # (which also takes it) is never blocked by an open dashboard.
     case $key in
-      1) ss_lock; cmd_setup; ss_unlock; ui_pause ;;
+      1) dash_lock || continue; cmd_setup; ss_unlock; ui_pause ;;
       2) ui_clear; cmd_check; ui_pause ;;
-      3) ss_lock; ui_clear; task_updates; ss_unlock; ui_pause ;;
-      4) if [[ $D_TYPE == server ]]; then ss_lock; screen_users; ss_unlock; else coming_soon "Apps & dev tools"; fi ;;
-      5) ss_lock; screen_firewall; ss_unlock ;;
-      6|7|8) menu_items; coming_soon "${MENU_LABELS[$((key - 1))]}" ;;
-      h|H) ss_lock; screen_history; ss_unlock ;;
+      3) dash_lock || continue; ui_clear; task_updates; ss_unlock; ui_pause ;;
+      4) if [[ $D_TYPE == server ]]; then dash_lock || continue; screen_users; ss_unlock; else coming_soon "Apps & dev tools"; fi ;;
+      5) dash_lock || continue; screen_firewall; ss_unlock ;;
+      6|7) menu_items; coming_soon "${MENU_LABELS[$((key - 1))]}" ;;
+      8) screen_upgrade ;;
+      h|H) dash_lock || continue; screen_history; ss_unlock ;;
       q|Q|esc) ui_clear; exit 0 ;;
     esac
   done

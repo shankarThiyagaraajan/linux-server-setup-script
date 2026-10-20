@@ -174,7 +174,7 @@ ui_popup() {
       fi
     done
     row=$((row + 1)); ui_goto "$row" "$left"
-    printf '%s║%s %s %s║%s' "$color" "$C_0" "$(ui_pad "${C_DIM}Nothing changes until you confirm the plan. ↑/↓ move · enter select · esc close$C_0" $((w - 4)))" "$color" "$C_0"
+    printf '%s║%s %s %s║%s' "$color" "$C_0" "$(ui_pad "${C_DIM}${UI_POPUP_NOTE-Nothing changes until you confirm the plan. }↑/↓ move · enter select · esc close$C_0" $((w - 4)))" "$color" "$C_0"
     row=$((row + 1)); ui_goto "$row" "$left"
     printf '%s╚%s╝%s' "$color" "$(rep ═ $((w - 2)))" "$C_0"
     key=$(ui_key)

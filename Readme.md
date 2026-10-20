@@ -4,7 +4,7 @@
 
 One tool to set up, check and look after Ubuntu machines, whether a cloud server, a home server or your own laptop. It opens a dashboard (the **Control Room**) that shows how the machine is doing and what server-setup last did, and every change it makes can be previewed first and undone later.
 
-> **Status:** v3 is in development. This first release covers setup, the security check, updates, history and undo. Alerts, schedules, release upgrades and the personal-computer extras are coming next (they show as "coming soon" in the menu).
+> **Status:** v3 is in development. It covers setup, the security check, updates, Ubuntu release upgrades, history and undo. Alerts, schedules and the personal-computer extras are coming next (they show as "coming soon" in the menu).
 
 ## Supported systems
 
@@ -35,6 +35,7 @@ sudo server-setup
 | `sudo server-setup updates` | Install updates now |
 | `sudo server-setup history` | What server-setup did on this machine, and when |
 | `sudo server-setup rollback RUN_ID [--ssh]` | Put back the files a run changed |
+| `sudo server-setup release-upgrade [--check]` | Upgrade to the next Ubuntu release (the dashboard's **Upgrade Ubuntu** does the same with live progress) |
 
 Options: `--dry-run` shows every change as a diff without making it, `--yes --config FILE` runs without questions, `--type server|personal|wsl` skips the machine-type question, and `--no-confirm-timer` is for provisioning tools that verify SSH themselves.
 
@@ -58,6 +59,15 @@ Changing SSH is how people lock themselves out, so setup never removes your way 
 1. When the port changes, SSH listens on **both** the old and new port.
 2. An undo timer starts. If you don't confirm within 10 minutes, the previous SSH configuration is restored automatically.
 3. Open a **new** terminal, log in on the new port, and run `sudo server-setup confirm`. That closes the old port and stops the timer. Confirming from the session you ran setup in is refused, because that session proves nothing.
+
+## Upgrading Ubuntu
+
+**Upgrade Ubuntu** (key `8`) handles the whole move to the next release without you leaving the dashboard:
+
+1. **Before.** A pop-up checks that the machine is ready: a newer release on your channel, updates installed, no restart pending, enough disk space, no unconfirmed SSH change, and on a laptop, the charger plugged in. Most problems can be fixed from the pop-up itself (install updates, install the upgrade tool, restart, switch between LTS-only and every release). A last confirmation reminds you to take a backup and defaults to **Not now**.
+2. **During.** The upgrade runs in its own systemd unit, so a dropped SSH connection or closing the dashboard does not stop it. The screen shows the phase, the elapsed time and the live log; press `b` to go back and `8` to return. The full log can be scrolled in the dashboard and is kept in `/var/log/server-setup-release-upgrade.log`.
+3. **Before the restart.** It checks that you can still get in: the SSH config loads with the new OpenSSH, SSH is running, sudo rules are valid, and the firewall and Fail2ban are up. If the server-setup SSH settings no longer load, they are re-written for the new OpenSSH, keeping your ports and login methods, and SSH is restarted at once. If anything is still wrong, the pop-up says so in red and does not offer the restart as the default.
+4. **After.** A welcome pop-up runs the security check and lets you turn paused third-party sources back on, one by one.
 
 ## Tracking, drift and undo
 

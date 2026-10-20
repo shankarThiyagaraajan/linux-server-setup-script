@@ -8,7 +8,7 @@
 
 # >>> libs (tools/build.sh inlines these into one file)
 SS_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)"
-for _f in core config state files os ui modules/users modules/ssh modules/system checks setup dashboard; do
+for _f in core config state files os ui modules/users modules/ssh modules/system modules/release checks setup dashboard; do
   # shellcheck source=/dev/null
   . "$SS_LIB/$_f.sh"
 done
@@ -31,6 +31,9 @@ Commands
   updates           Install updates now
   history           Show what server-setup has done on this machine
   rollback RUN_ID   Put back the files a run changed (--ssh: only SSH files)
+  release-upgrade [--check]
+                    Upgrade to the next Ubuntu release (the dashboard's
+                    Upgrade Ubuntu does the same, with live progress)
   version | help
 
 Options
@@ -45,7 +48,7 @@ EOF
 }
 
 main() {
-  local cmd="" json=false ssh_only=false run_arg=""
+  local cmd="" json=false ssh_only=false run_arg="" check_only=false
   while (( $# )); do
     case $1 in
       -y|--yes)            SS_ASSUME_YES=true ;;
@@ -56,9 +59,10 @@ main() {
       --no-confirm-timer)  SS_NO_CONFIRM=true ;;
       --json)              json=true ;;
       --ssh)               ssh_only=true ;;
+      --check)             check_only=true ;;
       -h|--help|help)      usage; exit 0 ;;
       -V|--version|version) echo "server-setup $SS_VERSION"; exit 0 ;;
-      dashboard|setup|confirm|check|updates|history|rollback)
+      dashboard|setup|confirm|check|updates|history|rollback|release-upgrade|__release-run)
                            [[ -z $cmd ]] || die "Only one command at a time."; cmd=$1 ;;
       *)                   if [[ $cmd == rollback && -z $run_arg ]]; then run_arg=$1; else usage >&2; die "Unknown argument: $1"; fi ;;
     esac
@@ -87,6 +91,10 @@ main() {
       ss_lock; ss_log_to_file confirm; cmd_confirm ;;
     updates)
       ss_lock; ss_log_to_file updates; task_updates ;;
+    release-upgrade)
+      ss_lock; cmd_release_upgrade "$check_only"; exit "$CHECK_RC" ;;
+    __release-run)
+      cmd_release_run ;;
     rollback)
       [[ -n $run_arg ]] || { list_runs_with_backups; die "Give a run id from the list above."; }
       [[ $run_arg =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || die "Not a run id: $run_arg"
