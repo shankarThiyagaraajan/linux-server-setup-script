@@ -9,7 +9,7 @@ CHK_PASS=0; CHK_WARN=0; CHK_FAIL=0; CHK_SCORE=100
 
 chk() {   # chk STATUS ID "message" ["fix"]
   local st=$1 id=$2 msg=$3 fix=${4:-}
-  if [[ $st =~ ^(WARN|FAIL)$ && $(state_get "recommendations.$id.decision" 2>/dev/null) == skip ]]; then
+  if [[ $st =~ ^(WARN|FAIL)$ && $(state_get "recommendations.$id.decision" 2>/dev/null) =~ ^(skip|never)$ ]]; then
     st=SKIP; msg="$msg (skipped by you)"; fix=""
   fi
   case $st in PASS) CHK_PASS=$((CHK_PASS + 1)) ;; WARN) CHK_WARN=$((CHK_WARN + 1)) ;; FAIL) CHK_FAIL=$((CHK_FAIL + 1)) ;; esac
@@ -103,6 +103,9 @@ run_checks() {
   v=$(_watch_py summary 2>/dev/null | awk -F'\t' '$1=="unreviewed" {print $3 + 0}')
   if (( ${v:-0} > 0 )); then chk FAIL EVT-OPEN "$n security event(s) to review, $v critical" "Dashboard: press e"
   elif (( ${n:-0} > 0 )); then chk WARN EVT-OPEN "$n security event(s) to review" "Dashboard: press e"; fi
+
+  # ---- optional hardening (only what fits this machine; never scored unless in place)
+  rec_checks
 
   # ---- drift
   n=$(drift_files | grep -c . || true)

@@ -21,6 +21,7 @@ declare -gA CFG_DEFAULTS=(
   [AUTO_REBOOT]="false"
   [REBOOT_TIME]="04:00"
   [TIMEZONE]=""                # blank = keep the current timezone
+  [RECOMMENDATIONS]=""         # optional hardening to apply, e.g. "REC-SYSCTL REC-AUDITD"
 )
 
 declare -gA CFG=()
@@ -107,6 +108,9 @@ cfg_validate() {
   [[ ${CFG[PROFILE]} =~ ^(base|web|custom)$ ]] || errs+=("PROFILE must be base, web or custom")
   for c in ${CFG[COMPONENTS]}; do
     [[ $c =~ ^(ssh|firewall|fail2ban|autoupdates|timesync|watch)$ ]] || errs+=("unknown component: $c")
+  done
+  for c in ${CFG[RECOMMENDATIONS]}; do
+    [[ -v "REC_TITLE[$c]" ]] || errs+=("unknown recommendation: $c (see: server-setup recommendations)")
   done
   for u in ${CFG[ADMIN_USERS]} ${CFG[SSH_USERS]}; do
     valid_username "$u" || errs+=("invalid user name: $u")

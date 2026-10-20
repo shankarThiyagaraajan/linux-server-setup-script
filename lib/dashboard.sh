@@ -91,7 +91,7 @@ panel_system() {
 }
 
 panel_security() {
-  local rows=() rules banned
+  local rows=() rules banned n
   if [[ -n $D_EFF ]]; then
     if [[ $(sshd_value passwordauthentication "$D_EFF") == no && $(sshd_value permitrootlogin "$D_EFF") == no ]]; then
       rows+=("$(ok_mark) SSH key-only · root login off")
@@ -110,6 +110,8 @@ panel_security() {
   if (( D_SEC_UPD > 0 )); then rows+=("$(warn_mark) $D_SEC_UPD security update(s) waiting")
   elif (( D_ALL_UPD > 0 )); then rows+=("$(ok_mark) No security updates · $D_ALL_UPD other")
   else rows+=("$(ok_mark) Up to date"); fi
+  n=$(rec_open_ids | grep -c . || true)
+  (( n > 0 )) && rows+=("${C_CYAN}●${C_0} $n recommendation(s) · press 9")
   panel "Security" "$1" "${rows[@]}"
 }
 
@@ -191,17 +193,17 @@ panel_machine() {
 # ------------------------------------------------------------------ menu
 menu_items() {
   if [[ $D_TYPE == server ]]; then
-    MENU_KEYS=(1 2 3 4 5 6 7 8 h q)
-    MENU_LABELS=("Set up server" "Security check" "Install updates" "Users & SSH keys" "Firewall & ports" "Alerts" "Schedule" "Upgrade Ubuntu" "History" "Quit")
+    MENU_KEYS=(1 2 3 4 5 6 7 8 9 h q)
+    MENU_LABELS=("Set up server" "Security check" "Install updates" "Users & SSH keys" "Firewall & ports" "Alerts" "Schedule" "Upgrade Ubuntu" "Recommendations" "History" "Quit")
   else
-    MENU_KEYS=(1 2 3 4 5 6 7 8 h q)
-    MENU_LABELS=("Set up this computer" "Security check" "Install updates" "Apps & dev tools" "Firewall & ports" "Privacy" "Backups" "Upgrade Ubuntu" "History" "Quit")
+    MENU_KEYS=(1 2 3 4 5 6 7 8 9 h q)
+    MENU_LABELS=("Set up this computer" "Security check" "Install updates" "Apps & dev tools" "Firewall & ports" "Privacy" "Backups" "Upgrade Ubuntu" "Recommendations" "History" "Quit")
   fi
 }
 # Screens that arrive in later updates are shown dimmed.
 menu_ready() {
   case "$D_TYPE:$1" in
-    *:1|*:2|*:3|*:5|*:8|*:h|*:q|server:4) return 0 ;;
+    *:1|*:2|*:3|*:5|*:8|*:9|*:h|*:q|server:4) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -355,6 +357,7 @@ dashboard() {
       5) dash_lock || continue; screen_firewall; ss_unlock ;;
       6|7) menu_items; coming_soon "${MENU_LABELS[$((key - 1))]}" ;;
       8) screen_upgrade ;;
+      9) screen_recommendations ;;
       e|E) screen_events ;;
       w|W) if ! watch_installed; then watch_turn_on; fi ;;
       h|H) dash_lock || continue; screen_history; ss_unlock ;;

@@ -204,6 +204,7 @@ run_wizard() {   # run_wizard [components-only]
   printf '\n  %s%s setup%s · %s · %s\n' "$C_CYAN$C_BOLD" "${MT_LABEL[${CFG[MACHINE_TYPE]}]}" "$C_0" "$(hostname)" "$OS_PRETTY"
   if [[ ${1:-} != components-only && ${CFG[MACHINE_TYPE]} == server ]]; then wizard_profile || return 1; fi
   wizard_components || return 1
+  wizard_recommendations || return 1
   if [[ ${1:-} != components-only ]]; then
     if [[ ${CFG[MACHINE_TYPE]} == server ]]; then wizard_users || return 1; fi
     wizard_network
@@ -233,6 +234,7 @@ apply_all() {
   cfg_has autoupdates && apply_autoupdates
   cfg_has timesync && apply_timesync
   cfg_has watch && apply_watch
+  [[ -n ${CFG[RECOMMENDATIONS]} ]] && apply_recommendations
   [[ ${CFG[MACHINE_TYPE]} == server ]] && apply_root_lock
   cfg_has ssh && ssh_restart
   return 0
@@ -249,6 +251,7 @@ show_plan_and_confirm() {
   step "Plan: what will change"
   printf '  Machine:     %s\n' "${MT_LABEL[${CFG[MACHINE_TYPE]}]}"
   printf '  Parts:       %s\n' "${CFG[COMPONENTS]:-none}"
+  [[ -n ${CFG[RECOMMENDATIONS]} ]] && printf '  Hardening:   %s\n' "${CFG[RECOMMENDATIONS]}"
   [[ ${CFG[MACHINE_TYPE]} == server ]] && printf '  Admins:      %s (sudo, SSH keys)\n' "${CFG[ADMIN_USERS]}"
   [[ -n ${CFG[SSH_USERS]} ]] && printf '  Also SSH:    %s\n' "${CFG[SSH_USERS]}"
   cfg_has ssh && printf '  SSH port:    %s\n' "${CFG[SSH_PORT]:-unchanged}"
