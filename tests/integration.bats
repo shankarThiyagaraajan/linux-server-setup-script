@@ -14,7 +14,7 @@ setup_file() {
   ssh-keygen -q -t ed25519 -N '' -f "$T/id" >/dev/null
   cat >"$T/server.env" <<CFG
 PROFILE="web"
-COMPONENTS="ssh firewall fail2ban autoupdates timesync"
+COMPONENTS="ssh firewall fail2ban autoupdates timesync watch"
 ADMIN_USERS="opsadmin"
 ADMIN_PUBKEY="$T/id.pub"
 ADMIN_PASSWORD_HASH='$(openssl passwd -6 'correct horse battery')'
@@ -39,6 +39,9 @@ ss() { "${SS_BIN:-$BATS_TEST_DIRNAME/../bin/server-setup}" "$@"; }
   sshd -t
   id -nG opsadmin | grep -qw sudo
   id -nG opsadmin | grep -qw ssh-users
+  grep -qx 'ProtectSystem=strict' /etc/systemd/system/server-setup-watch.service
+  grep -q 'systemctl restart server-setup-watch' "$SHIM_LOG"
+  [ -x /etc/update-motd.d/60-server-setup ]
   grep -qF "$(cut -d' ' -f2 "$T/id.pub")" /home/opsadmin/.ssh/authorized_keys
   [ "$(passwd -S opsadmin | awk '{print $2}')" = P ]
   [ "$(passwd -S root | awk '{print $2}')" = L ]
@@ -104,4 +107,11 @@ ss() { "${SS_BIN:-$BATS_TEST_DIRNAME/../bin/server-setup}" "$@"; }
   [ "$status" -eq 2 ]
   [[ $output == *"SSH_PORT"* && $output == *"invalid port: 80/xyz"* && $output == *"invalid user name"* ]]
   [ "$before" = "$(ls -l /etc/ssh/sshd_config.d)" ]
+}
+
+@test "the events command scans and lists without failing" {
+  run ss events --json
+  echo "$output"
+  [ "$status" -eq 0 ]
+  python3 -c 'import json,sys; json.loads(sys.stdin.read())' <<<"$output"
 }

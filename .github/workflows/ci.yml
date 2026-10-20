@@ -47,7 +47,7 @@ jobs:
       - name: Reset the container
         run: |
           userdel -r opsadmin || true
-          rm -f /etc/ssh/sshd_config.d/00-server-setup.conf
+          rm -f /etc/ssh/sshd_config.d/00-server-setup.conf /etc/systemd/system/server-setup-watch.service /etc/update-motd.d/60-server-setup
           passwd -u root || true
       - name: Setup, confirm and rollback (bundled file)
         run: SS_INTEGRATION=1 SS_BIN=$PWD/dist/server-setup bats tests/integration.bats

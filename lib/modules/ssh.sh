@@ -32,7 +32,7 @@ ssh_filter_algos() {  # keep only what this OpenSSH build supports
 ssh_render() {
   local p eff methods kex ciphers macs kbd=no
   eff=$(sshd_effective || true)
-  methods=$(sshd_value authenticationmethods "$eff")
+  methods=${SS_SSH_METHODS:-$(sshd_value authenticationmethods "$eff")}
   # Keep a multi-factor setup (e.g. publickey,keyboard-interactive) instead of replacing it.
   if [[ $methods == *,* ]]; then kbd=yes; else methods=publickey; fi
   kex=$(ssh_filter_algos kex "mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com,sntrup761x25519-sha512,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512")
@@ -116,7 +116,7 @@ apply_ssh() {
   for want in "passwordauthentication no" "permitrootlogin no" "port $new_port" "pubkeyauthentication yes"; do
     if ! grep -qix "$want" <<<"$eff"; then
       ssh_restore_files
-      die "Another SSH config file overrides '$want'. Check /etc/ssh/sshd_config and sshd_config.d/, then run_cmd again."
+      die "Another SSH config file overrides '$want'. Check /etc/ssh/sshd_config and sshd_config.d/, then run again."
     fi
   done
   if grep -qi '^allowusers ' <<<"$eff"; then
