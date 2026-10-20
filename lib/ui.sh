@@ -28,10 +28,18 @@ ui_pad() {
   printf '%s%*s' "$t" $(( w - n )) ''
 }
 
-# ui_key: read one key; prints up, down, left, right, enter, space, esc, tab or the character.
+# ui_key: read one key; prints up, down, left, right, enter, space, esc, tab
+# or the character. ui_key_wait SECONDS prints "timeout" if nothing is pressed.
+ui_key_wait() { UI_KEY_TIMEOUT=$1 ui_key; }
 ui_key() {
-  local k k2=""
-  IFS= read -rsn1 k </dev/tty || { echo esc; return; }
+  local k k2="" rc=0
+  if [[ -n ${UI_KEY_TIMEOUT:-} ]]; then
+    IFS= read -rsn1 -t "$UI_KEY_TIMEOUT" k </dev/tty || rc=$?
+    (( rc > 128 )) && { echo timeout; return; }
+    (( rc == 0 )) || { echo esc; return; }
+  else
+    IFS= read -rsn1 k </dev/tty || { echo esc; return; }
+  fi
   case $k in
     $'\e') IFS= read -rsn2 -t 0.05 k2 </dev/tty || true
             case $k2 in '[A') echo up ;; '[B') echo down ;; '[C') echo right ;; '[D') echo left ;; *) echo esc ;; esac ;;
@@ -83,9 +91,9 @@ ui_menu() {
     for i in "${!items[@]}"; do
       label=${items[$i]%%|*}; hint=${items[$i]#*|}; [[ $hint == "${items[$i]}" ]] && hint=""
       if (( i == sel )); then
-        printf '\e[2K  %s› %s%s  %s%s\n' "$C_INV$C_CYAN" "$(ui_pad "$label" 34)" "$C_0" "$hint" "$C_0"
+        printf '\e[2K  %s› %s%s  %s%s\n' "$C_INV$C_CYAN" "$(ui_pad "$label" "${UI_MENU_WIDTH:-34}")" "$C_0" "$hint" "$C_0"
       else
-        printf '\e[2K    %s  %s%s%s\n' "$(ui_pad "$label" 34)" "$C_DIM" "$hint" "$C_0"
+        printf '\e[2K    %s  %s%s%s\n' "$(ui_pad "$label" "${UI_MENU_WIDTH:-34}")" "$C_DIM" "$hint" "$C_0"
       fi
     done
     printf '\e[2K  %s↑/↓ move · enter select · esc back%s\n' "$C_DIM" "$C_0"
@@ -151,6 +159,14 @@ ui_popup() {
   local cols lines w h top left sel=0 n=${#items[@]} i key row label hint
   cols=$(ui_cols); lines=$(ui_lines)
   w=$(( cols - 6 )); (( w > 100 )) && w=100
+  # Wrap long plain lines (coloured ones are kept as they are).
+  local wrapped=()
+  for a in "${body[@]}"; do
+    if (( $(ui_len "$a") > w - 4 )) && [[ $a != *$'\e'* ]]; then
+      mapfile -t -O "${#wrapped[@]}" wrapped < <(fold -s -w $(( w - 4 )) <<<"$a" | sed 's/ *$//')
+    else wrapped+=("$a"); fi
+  done
+  body=("${wrapped[@]}")
   h=$(( ${#body[@]} + n + 6 ))
   top=$(( (lines - h) / 2 )); (( top < 1 )) && top=1
   left=$(( (cols - w) / 2 + 1 ))

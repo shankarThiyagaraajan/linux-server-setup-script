@@ -92,6 +92,18 @@ run_checks() {
     else chk WARN F2B-ACTIVE "Fail2ban is not running" "Set up server → Fail2ban"; fi
   fi
 
+  # ---- security watch
+  if [[ " $(state_get setup.components | tr -d '[]",') " == *" watch "* ]] || watch_installed; then
+    if watch_running; then chk PASS WATCH-ON "Security watch is running"
+    else chk WARN WATCH-ON "Security watch is not running" "sudo systemctl restart $WATCH_UNIT"; fi
+  else
+    chk WARN WATCH-ON "Security watch is off" "Dashboard: press w"
+  fi
+  n=$(_watch_py summary 2>/dev/null | awk -F'\t' '$1=="unreviewed" {print $2 + 0}')
+  v=$(_watch_py summary 2>/dev/null | awk -F'\t' '$1=="unreviewed" {print $3 + 0}')
+  if (( ${v:-0} > 0 )); then chk FAIL EVT-OPEN "$n security event(s) to review, $v critical" "Dashboard: press e"
+  elif (( ${n:-0} > 0 )); then chk WARN EVT-OPEN "$n security event(s) to review" "Dashboard: press e"; fi
+
   # ---- drift
   n=$(drift_files | grep -c . || true)
   if (( n > 0 )); then chk WARN DRIFT "$n managed file(s) were changed outside server-setup" "Set up server → Review the changes"; fi

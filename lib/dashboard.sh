@@ -227,13 +227,14 @@ dash_draw() {
     dash_header "$(( w3 * 3 + 2 ))"
     side_by_side "$w3" "$(panel_system "$w3")" "$(panel_security "$w3")" "$(panel_lastruns "$w3")"
     side_by_side "$w3" "$(panel_ports "$w3")" "$(panel_events "$w3")" "$(panel_machine "$w3")"
+    panel_watch "$(( w3 * 3 + 2 ))"
   else
     w2=$(( cols - 1 ))
     dash_header "$w2"
-    panel_security "$w2"; panel_lastruns "$w2"; panel_system "$w2"; panel_events "$w2"
+    panel_watch "$w2"; panel_security "$w2"; panel_lastruns "$w2"; panel_system "$w2"
   fi
   dash_keybar
-  printf ' %sr refresh · keys work without enter%s\n' "$C_DIM" "$C_0"
+  printf ' %se security events · r refresh (it also refreshes itself) · keys work without enter%s\n' "$C_DIM" "$C_0"
 }
 
 # ------------------------------------------------------------------ screens
@@ -337,8 +338,13 @@ dashboard() {
   trap 'ui_show_cursor' EXIT
   rel_welcome_popup
   while true; do
+    watch_scan
+    # New events that need attention pop up as they arrive.
+    if (( $(_watch_py summary 2>/dev/null | awk -F'\t' '$1=="unreviewed" {print $4}') > $(state_get events_popup_upto || echo 0) + 0 )); then
+      events_attention_popup
+    fi
     dash_draw
-    key=$(ui_key)
+    key=$(ui_key_wait 30)
     # The lock is held only while something changes, so the SSH undo timer
     # (which also takes it) is never blocked by an open dashboard.
     case $key in
@@ -349,6 +355,8 @@ dashboard() {
       5) dash_lock || continue; screen_firewall; ss_unlock ;;
       6|7) menu_items; coming_soon "${MENU_LABELS[$((key - 1))]}" ;;
       8) screen_upgrade ;;
+      e|E) screen_events ;;
+      w|W) if ! watch_installed; then watch_turn_on; fi ;;
       h|H) dash_lock || continue; screen_history; ss_unlock ;;
       q|Q|esc) ui_clear; exit 0 ;;
     esac

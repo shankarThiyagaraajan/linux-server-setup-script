@@ -8,7 +8,7 @@
 
 # >>> libs (tools/build.sh inlines these into one file)
 SS_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)"
-for _f in core config state files os ui modules/users modules/ssh modules/system modules/release checks setup dashboard; do
+for _f in core config state files os ui modules/users modules/ssh modules/system modules/release modules/watch checks setup dashboard; do
   # shellcheck source=/dev/null
   . "$SS_LIB/$_f.sh"
 done
@@ -31,6 +31,8 @@ Commands
   updates           Install updates now
   history           Show what server-setup has done on this machine
   rollback RUN_ID   Put back the files a run changed (--ssh: only SSH files)
+  events [--json]   Security events found by the watch (newest first)
+  watch [--once]    Run the security watch (the systemd service runs this)
   release-upgrade [--check]
                     Upgrade to the next Ubuntu release (the dashboard's
                     Upgrade Ubuntu does the same, with live progress)
@@ -48,7 +50,7 @@ EOF
 }
 
 main() {
-  local cmd="" json=false ssh_only=false run_arg="" check_only=false
+  local cmd="" json=false ssh_only=false run_arg="" check_only=false once=false
   while (( $# )); do
     case $1 in
       -y|--yes)            SS_ASSUME_YES=true ;;
@@ -60,9 +62,10 @@ main() {
       --json)              json=true ;;
       --ssh)               ssh_only=true ;;
       --check)             check_only=true ;;
+      --once)              once=true ;;
       -h|--help|help)      usage; exit 0 ;;
       -V|--version|version) echo "server-setup $SS_VERSION"; exit 0 ;;
-      dashboard|setup|confirm|check|updates|history|rollback|release-upgrade|__release-run)
+      dashboard|setup|confirm|check|updates|history|rollback|release-upgrade|__release-run|watch|events)
                            [[ -z $cmd ]] || die "Only one command at a time."; cmd=$1 ;;
       *)                   if [[ $cmd == rollback && -z $run_arg ]]; then run_arg=$1; else usage >&2; die "Unknown argument: $1"; fi ;;
     esac
@@ -75,7 +78,8 @@ main() {
   require_root "$cmd"
   os_load
   os_require_supported
-  ss_prepare_dirs
+  # The watch service runs with a read-only /etc; it only needs its state dir.
+  if [[ $cmd == watch ]]; then install -d -m 700 "$SS_STATE_DIR"; else ss_prepare_dirs; fi
 
   case $cmd in
     check)
@@ -95,6 +99,12 @@ main() {
       ss_lock; cmd_release_upgrade "$check_only"; exit "$CHECK_RC" ;;
     __release-run)
       cmd_release_run ;;
+    watch)
+      if $once; then cmd_watch once; else cmd_watch; fi ;;
+    events)
+      watch_scan
+      if $json; then _watch_py list 200 | python3 -I -c 'import json,sys; k=("id","time","severity","kind","reviewed","ip","user","message"); print(json.dumps([dict(zip(k, l.rstrip("\n").split("\x1f"))) for l in sys.stdin], indent=2))'
+      else _watch_py list 50 | awk -F'\x1f' '{printf "%-25s %-9s %-4s %s\n", $2, $3, ($5=="no" ? "NEW" : ""), $8}'; fi ;;
     rollback)
       [[ -n $run_arg ]] || { list_runs_with_backups; die "Give a run id from the list above."; }
       [[ $run_arg =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || die "Not a run id: $run_arg"

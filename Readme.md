@@ -4,7 +4,7 @@
 
 One tool to set up, check and look after Ubuntu machines, whether a cloud server, a home server or your own laptop. It opens a dashboard (the **Control Room**) that shows how the machine is doing and what server-setup last did, and every change it makes can be previewed first and undone later.
 
-> **Status:** v3 is in development. It covers setup, the security check, updates, Ubuntu release upgrades, history and undo. Alerts, schedules and the personal-computer extras are coming next (they show as "coming soon" in the menu).
+> **Status:** v3 is in development. It covers setup, the security check, the live security watch, updates, Ubuntu release upgrades, history and undo. Alerts, schedules and the personal-computer extras are coming next (they show as "coming soon" in the menu).
 
 ## Supported systems
 
@@ -35,6 +35,7 @@ sudo server-setup
 | `sudo server-setup updates` | Install updates now |
 | `sudo server-setup history` | What server-setup did on this machine, and when |
 | `sudo server-setup rollback RUN_ID [--ssh]` | Put back the files a run changed |
+| `sudo server-setup events [--json]` | Security events found by the watch, newest first |
 | `sudo server-setup release-upgrade [--check]` | Upgrade to the next Ubuntu release (the dashboard's **Upgrade Ubuntu** does the same with live progress) |
 
 Options: `--dry-run` shows every change as a diff without making it, `--yes --config FILE` runs without questions, `--type server|personal|wsl` skips the machine-type question, and `--no-confirm-timer` is for provisioning tools that verify SSH themselves.
@@ -49,6 +50,7 @@ Exit codes: `0` ok, `1` warnings, `2` failures or invalid settings, `3` server-s
 - Fail2ban for SSH, including repeat offenders.
 - Automatic security updates, with reboots only if you allow them.
 - Time sync and time zone.
+- The security watch (below).
 
 It installs only missing packages. It never upgrades the whole system during setup; that is what `updates` is for.
 
@@ -59,6 +61,30 @@ Changing SSH is how people lock themselves out, so setup never removes your way 
 1. When the port changes, SSH listens on **both** the old and new port.
 2. An undo timer starts. If you don't confirm within 10 minutes, the previous SSH configuration is restored automatically.
 3. Open a **new** terminal, log in on the new port, and run `sudo server-setup confirm`. That closes the old port and stops the timer. Confirming from the session you ran setup in is refused, because that session proves nothing.
+
+## Security watch
+
+A small systemd service (`server-setup-watch`) follows the system journal live and records security events. It only reads; it never changes anything by itself.
+
+| Level | Examples |
+|---|---|
+| **Critical** | root logged in over SSH; a login right after many failed attempts from the same address; a new UID 0 account; an SSH key added for root; `/etc/ld.so.preload` appearing |
+| **Important** | a login from a new address or with a password; 10+ failed logins in an hour to a real account; sudo misuse; new accounts or admins; SSH key, sudoers, SSH server, cron or system service changes; a new program listening on the network; out-of-memory kills |
+| **Info** | normal logins and password changes, kept for the timeline |
+
+Bot noise (guessing at accounts that don't exist) is counted, not alerted on. Your trusted ranges are never flagged. Changes server-setup makes itself are recorded as info, and the first run only learns what is normal, so turning the watch on does not raise alarms about the past.
+
+Events reach you in three places:
+- **Dashboard.** The Security watch panel shows what needs attention, and new important events open a pop-up as they arrive (the dashboard refreshes itself every 30 seconds; critical events also ring the terminal bell). Press `e` for the full list.
+- **Login message.** While events wait for review, SSH logins show a short notice.
+- **Security check.** Unreviewed events show up in `server-setup check`, and critical ones make it fail.
+
+Each event has actions in its pop-up:
+- **This was me.** Marks the event as reviewed.
+- **Block the address.** Adds a firewall deny at the top of the rules. It refuses your own address, local addresses and your trusted ranges.
+- **Lock the account.** Locks the password, expires the account so SSH keys stop working too, and ends its sessions. It refuses root, your own account and the last admin.
+
+The service is hardened with a read-only system view (`ProtectSystem=strict`, `NoNewPrivileges`), writes only to `/var/lib/server-setup`, and runs with low priority, a 256 MB memory limit and a 20% CPU limit. On a machine set up before the watch existed, press `w` in the dashboard to turn it on.
 
 ## Upgrading Ubuntu
 

@@ -2,7 +2,7 @@
 # Test double: records calls; pretends services exist and are active.
 echo "systemctl $*" >>"${SHIM_LOG:?}"
 case "$1" in
-  is-active|is-enabled) [[ "$*" == *ssh.socket* ]] && exit 1; [[ "$*" == *release-upgrade* && ! -f "$SHIM_DIR/rel.on" ]] && exit 3; [[ "$*" == *fail2ban* && ! -f "$SHIM_DIR/f2b.on" ]] && exit 3; exit 0 ;;
+  is-active|is-enabled) [[ "$*" == *ssh.socket* ]] && exit 1; [[ "$*" == *release-upgrade* && ! -f "$SHIM_DIR/rel.on" ]] && exit 3; [[ "$*" == *server-setup-watch* && ! -f "$SHIM_DIR/watch.on" ]] && exit 3; [[ "$*" == *fail2ban* && ! -f "$SHIM_DIR/f2b.on" ]] && exit 3; exit 0 ;;
   get-default) echo multi-user.target ;;
   restart) [[ "$*" == *fail2ban* ]] && touch "$SHIM_DIR/f2b.on"; exit 0 ;;
   --failed) exit 0 ;;

@@ -77,14 +77,15 @@ wizard_profile() {
 
 wizard_components() {
   local all names=() i c on items=() desc
-  if [[ ${CFG[MACHINE_TYPE]} == server ]]; then all="ssh firewall fail2ban autoupdates timesync"
-  else all="firewall autoupdates timesync ssh fail2ban"; fi
+  if [[ ${CFG[MACHINE_TYPE]} == server ]]; then all="ssh firewall fail2ban autoupdates timesync watch"
+  else all="firewall autoupdates timesync watch ssh fail2ban"; fi
   declare -A desc=(
     [ssh]="SSH|keys only, no root login, limited to the ssh-users group"
     [firewall]="Firewall|block incoming connections except the ones you allow"
     [fail2ban]="Fail2ban|ban addresses that keep failing to log in"
     [autoupdates]="Automatic updates|install security updates every day"
     [timesync]="Clock sync|keep the clock correct (needed for logs and TLS)"
+    [watch]="Security watch|alert on suspicious logins, new admins, key and config changes"
   )
   for c in $all; do
     on=off; cfg_has "$c" && on=on
@@ -176,7 +177,7 @@ wizard_network() {
     done
   fi
   if cfg_has firewall || cfg_has fail2ban; then
-    ip=${SSH_CONNECTION%% *}
+    ip=${SSH_CONNECTION:-}; ip=${ip%% *}
     while true; do
       ui_input v "Trusted IPs/networks that are never rate-limited or banned${ip:+ (you are connecting from $ip)}" "${CFG[TRUSTED_CIDRS]}"
       local bad="" c; for c in $v; do valid_cidr "$c" || bad+=" $c"; done
@@ -231,6 +232,7 @@ apply_all() {
   cfg_has fail2ban && apply_fail2ban
   cfg_has autoupdates && apply_autoupdates
   cfg_has timesync && apply_timesync
+  cfg_has watch && apply_watch
   [[ ${CFG[MACHINE_TYPE]} == server ]] && apply_root_lock
   cfg_has ssh && ssh_restart
   return 0

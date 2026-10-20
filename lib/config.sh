@@ -8,7 +8,7 @@
 declare -gA CFG_DEFAULTS=(
   [MACHINE_TYPE]=""            # server | personal | wsl
   [PROFILE]="base"             # base | web | custom
-  [COMPONENTS]="ssh firewall fail2ban autoupdates timesync"
+  [COMPONENTS]="ssh firewall fail2ban autoupdates timesync watch"
   [ADMIN_USERS]=""             # space-separated; first one is the primary admin
   [ADMIN_PUBKEY]=""            # key text or file, for the first admin (unattended)
   [ADMIN_PASSWORD_HASH]=""     # crypt hash (openssl passwd -6), for unattended runs
@@ -106,7 +106,7 @@ cfg_validate() {
   [[ ${CFG[MACHINE_TYPE]} =~ ^(server|personal|wsl)$ ]] || errs+=("MACHINE_TYPE must be server, personal or wsl")
   [[ ${CFG[PROFILE]} =~ ^(base|web|custom)$ ]] || errs+=("PROFILE must be base, web or custom")
   for c in ${CFG[COMPONENTS]}; do
-    [[ $c =~ ^(ssh|firewall|fail2ban|autoupdates|timesync)$ ]] || errs+=("unknown component: $c")
+    [[ $c =~ ^(ssh|firewall|fail2ban|autoupdates|timesync|watch)$ ]] || errs+=("unknown component: $c")
   done
   for u in ${CFG[ADMIN_USERS]} ${CFG[SSH_USERS]}; do
     valid_username "$u" || errs+=("invalid user name: $u")
