@@ -9,7 +9,7 @@ CHK_PASS=0; CHK_WARN=0; CHK_FAIL=0; CHK_SCORE=100
 
 chk() {   # chk STATUS ID "message" ["fix"]
   local st=$1 id=$2 msg=$3 fix=${4:-}
-  if [[ $st =~ ^(WARN|FAIL)$ && $(state_get "recommendations.$id.decision" 2>/dev/null) == skip ]]; then
+  if [[ $st =~ ^(WARN|FAIL)$ && $(state_get "recommendations.$id.decision" 2>/dev/null) =~ ^(skip|never)$ ]]; then
     st=SKIP; msg="$msg (skipped by you)"; fix=""
   fi
   case $st in PASS) CHK_PASS=$((CHK_PASS + 1)) ;; WARN) CHK_WARN=$((CHK_WARN + 1)) ;; FAIL) CHK_FAIL=$((CHK_FAIL + 1)) ;; esac
@@ -104,6 +104,9 @@ run_checks() {
   if (( ${v:-0} > 0 )); then chk FAIL EVT-OPEN "$n security event(s) to review, $v critical" "Dashboard: press e"
   elif (( ${n:-0} > 0 )); then chk WARN EVT-OPEN "$n security event(s) to review" "Dashboard: press e"; fi
 
+  # ---- optional hardening (only what fits this machine; never scored unless in place)
+  rec_checks
+
   # ---- drift
   n=$(drift_files | grep -c . || true)
   if (( n > 0 )); then chk WARN DRIFT "$n managed file(s) were changed outside server-setup" "Set up server → Review the changes"; fi
@@ -112,6 +115,13 @@ run_checks() {
   CHK_SCORE=100
   (( total > 0 )) && CHK_SCORE=$(( (CHK_PASS * 100 + CHK_WARN * 50) / total ))
   return 0
+}
+
+check_fail_ids() { local r st id; for r in "${CHK_RESULTS[@]}"; do IFS=$'\t' read -r st id _ <<<"$r"; [[ $st == FAIL ]] && echo "$id"; done; return 0; }
+# check_save: remember the result (the daily job compares with it).
+check_save() {
+  # shellcheck disable=SC2046
+  state_set last_check "{\"score\": $CHK_SCORE, \"pass\": $CHK_PASS, \"warn\": $CHK_WARN, \"fail\": $CHK_FAIL, \"fail_ids\": $(json_list $(check_fail_ids))}"
 }
 
 # check_rc: 0 all good, 1 warnings, 2 failures.
@@ -147,7 +157,7 @@ cmd_check() {
   if [[ $json == true ]]; then checks_json; else step "Security check"; print_checks; fi
   check_rc || rc=$?
   if [[ $EUID -eq 0 ]]; then
-    state_set last_check "{\"score\": $CHK_SCORE, \"pass\": $CHK_PASS, \"warn\": $CHK_WARN, \"fail\": $CHK_FAIL}"
+    check_save
     history_add check "$( ((rc == 0)) && echo ok || echo attention)" "score $CHK_SCORE · $CHK_WARN warn · $CHK_FAIL fail"
   fi
   CHECK_RC=$rc

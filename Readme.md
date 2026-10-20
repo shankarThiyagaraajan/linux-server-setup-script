@@ -4,7 +4,7 @@
 
 One tool to set up, check and look after Ubuntu machines, whether a cloud server, a home server or your own laptop. It opens a dashboard (the **Control Room**) that shows how the machine is doing and what server-setup last did, and every change it makes can be previewed first and undone later.
 
-> **Status:** v3 is in development. It covers setup, the security check, the live security watch, updates, Ubuntu release upgrades, history and undo. Alerts, schedules and the personal-computer extras are coming next (they show as "coming soon" in the menu).
+> **Status:** v3 is in development. It covers setup, the security check, the live security watch, alerts, scheduled maintenance, recommendations, updates, Ubuntu release upgrades, history and undo. The personal-computer extras (apps and dev tools, privacy, backups) are coming next.
 
 ## Supported systems
 
@@ -37,6 +37,9 @@ sudo server-setup
 | `sudo server-setup rollback RUN_ID [--ssh]` | Put back the files a run changed |
 | `sudo server-setup events [--json]` | Security events found by the watch, newest first |
 | `sudo server-setup release-upgrade [--check]` | Upgrade to the next Ubuntu release (the dashboard's **Upgrade Ubuntu** does the same with live progress) |
+| `sudo server-setup recommendations [--json]` | Optional hardening for this machine and what you decided about each |
+| `sudo server-setup maintain daily\|weekly\|monthly` | Run a maintenance job now (the timers run these) |
+| `sudo server-setup alert-test` | Send a test alert to every channel that is set up |
 
 Options: `--dry-run` shows every change as a diff without making it, `--yes --config FILE` runs without questions, `--type server|personal|wsl` skips the machine-type question, and `--no-confirm-timer` is for provisioning tools that verify SSH themselves.
 
@@ -50,7 +53,8 @@ Exit codes: `0` ok, `1` warnings, `2` failures or invalid settings, `3` server-s
 - Fail2ban for SSH, including repeat offenders.
 - Automatic security updates, with reboots only if you allow them.
 - Time sync and time zone.
-- The security watch (below).
+- The security watch and scheduled maintenance (below).
+- Any recommendations you tick (below).
 
 It installs only missing packages. It never upgrades the whole system during setup; that is what `updates` is for.
 
@@ -86,6 +90,35 @@ Each event has actions in its pop-up:
 
 The service is hardened with a read-only system view (`ProtectSystem=strict`, `NoNewPrivileges`), writes only to `/var/lib/server-setup`, and runs with low priority, a 256 MB memory limit and a 20% CPU limit. On a machine set up before the watch existed, press `w` in the dashboard to turn it on.
 
+## Alerts
+
+**Alerts** (key `6`) sends security events and machine-health problems to your phone or team as they happen. Set up any of:
+
+| Channel | What you need |
+|---|---|
+| **ntfy** | The ntfy app and a long, hard-to-guess topic (`https://ntfy.sh/…`), or your own ntfy server with a token |
+| **Telegram** | A bot token from @BotFather and your chat id |
+| **Slack** | An incoming-webhook URL |
+| **Webhook** | Any HTTPS URL; each alert is POSTed as JSON (host, severity, title, text, kind, time, id) |
+| **Email** | `msmtp` set up with your mail provider in `/etc/msmtprc` (the one step done outside the dashboard, because the mail login is yours to type) |
+
+- By default important and critical events are sent; you can switch to critical only. Info events are never sent.
+- **Machine health** (on by default): a disk or its inodes over 90% full, memory almost full, a failed service. Each problem is sent once, and again only after it has recovered and come back.
+- A burst of more than five events becomes one message. A failed send is retried with back-off for a day, then reported as an event.
+- The watch service does the sending, so alerts go out with nobody logged in. Settings live in `/etc/server-setup/alerts.env` (root-only, never executed; see [examples/alerts.env](examples/alerts.env) for unattended installs), and tokens never appear in a command line. Only `https://` addresses are accepted.
+
+## Scheduled maintenance
+
+**Schedule** (key `7`) shows three systemd timers, with their next run and last result, and lets you turn each one on or off or run it now with live output.
+
+| Job | When | What it does |
+|---|---|---|
+| **Daily check** | every day, 06:30–07:00 | Runs the security check and alerts when the score drops or a new failure appears |
+| **Weekly updates & clean-up** | Sundays, 04:30–05:30 | Installs updates (security only by default; all or none if you choose), removes unused packages, trims the journal to 30 days, saves a backup of the settings server-setup manages to `/var/backups/server-setup` (the newest 8 are kept), and sends a short report |
+| **Monthly review** | the 1st, 05:00–06:00 | Tells you when a new Ubuntu release is out, and lists admin accounts nobody has used for 90 days |
+
+The timers are persistent (a run missed while the machine was off happens soon after it starts) and start at a random moment in their window, so a fleet does not update all at once. Settings: `MAINT_DAILY`, `MAINT_WEEKLY`, `MAINT_MONTHLY`, `MAINT_UPDATES` and `MAINT_BACKUPS_KEEP` in `config.env`.
+
 ## Upgrading Ubuntu
 
 **Upgrade Ubuntu** (key `8`) handles the whole move to the next release without you leaving the dashboard:
@@ -111,9 +144,26 @@ sudo server-setup setup --yes --type server --config examples/config.env
 
 See [examples/config.env](examples/config.env) for every setting. All values are validated, and all problems are reported together before anything changes.
 
-## Optional hardening is your call
+## Recommendations: optional hardening is your call
 
-Extra measures (disk encryption checks, Secure Boot, screen lock, auditd and similar) will be offered as recommendations with the reason and the trade-off, in a coming release. Nothing optional is applied unless you accept it. The security check already supports this: a recommendation you skip is shown as skipped rather than counted against your score.
+**Recommendations** (key `9`) lists extra hardening that fits this kind of machine. Each card says why it matters, which standard it comes from, what it might affect, whether it can be undone, and how long it takes. Nothing is applied unless you choose **Apply**, and Apply first shows exactly what will change.
+
+| ID | For | What it does | Standard |
+|---|---|---|---|
+| `REC-SYSCTL` | servers, computers | Kernel network hardening (no redirects or source routing, reverse-path filter, SYN cookies, hidden kernel pointers). IP forwarding is left alone. | CIS 3.3.x, 1.5.x |
+| `REC-AUDITD` | servers | auditd rules for accounts, sudo, SSH settings and keys, and privilege use | CIS 6.3.x · NIST 800-53 AU-2 |
+| `REC-PWQUALITY` | all | New passwords of at least 14 characters, no dictionary words | CIS 5.3.3.2.x · NIST 800-63B |
+| `REC-APPARMOR` | servers, computers | Keeps AppArmor on | CIS 1.3.1.x |
+| `REC-LIVEPATCH` | servers | Ubuntu Pro with Livepatch (check only: needs your free token) | Ubuntu security guidance |
+| `REC-DISK-ENCRYPTION` | computers | Disk encryption (check only: chosen at install time) | CIS Controls 3.6 · NIST 800-111 |
+| `REC-SECURE-BOOT` | computers | Secure Boot (check only: set in the firmware) | CIS Controls 2.5 · NIST 800-147 |
+| `REC-SCREEN-LOCK` | computers | Lock the screen after 5 idle minutes | CIS 1.7.x · NIST 800-53 AC-11 |
+| `REC-AUTOLOGIN` | computers | Turn off automatic login | CIS 1.7.x |
+
+- Each card offers **Apply** (or **I've done it** for check-only items), **Remind me in 14 days**, **Skip**, and **Never ask again**. Decisions are kept in `state.json`, so nothing is asked twice.
+- The setup wizard shows the ones that can be applied as a checklist, ticked by default, and you untick what you don't want.
+- Unattended runs apply only what `RECOMMENDATIONS` lists in the settings file; they never accept one on their own.
+- The security check shows each one: in place counts as a pass, open ones are listed as recommended without lowering the score, and skipped ones show as "skipped by you".
 
 ## Development
 

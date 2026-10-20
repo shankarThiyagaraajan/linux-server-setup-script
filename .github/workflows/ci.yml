@@ -48,6 +48,7 @@ jobs:
         run: |
           userdel -r opsadmin || true
           rm -f /etc/ssh/sshd_config.d/00-server-setup.conf /etc/systemd/system/server-setup-watch.service /etc/update-motd.d/60-server-setup
+          rm -f /etc/systemd/system/server-setup-maintain@.service /etc/systemd/system/server-setup-daily.timer /etc/systemd/system/server-setup-weekly.timer /etc/systemd/system/server-setup-monthly.timer /etc/security/pwquality.conf.d/50-server-setup.conf
           passwd -u root || true
       - name: Setup, confirm and rollback (bundled file)
         run: SS_INTEGRATION=1 SS_BIN=$PWD/dist/server-setup bats tests/integration.bats
