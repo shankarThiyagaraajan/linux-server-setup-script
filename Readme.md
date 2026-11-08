@@ -90,6 +90,32 @@ SS_INTEGRATION=1 bats tests/integration.bats   # THROWAWAY Ubuntu 24.04 containe
 
 The code lives in `bin/server-setup` and `lib/`, and `tools/build.sh` inlines it into one file for release.
 
+## Utilities
+
+Standalone helpers live in [util/](util/). They are not part of `server-setup` and are not bundled into `dist/server-setup`.
+
+### cleanup
+
+`util/cleanup` is one Python 3 file with no dependencies. It scans a Linux machine for disk space, RAM pressure and Claude Code memory notes that can be tidied, and cleans them with a way back.
+
+```bash
+install -m 755 util/cleanup ~/.local/bin/cleanup
+cleanup                  # menu (scan, storage, RAM, Claude memory, recover, purge)
+cleanup --scan           # report only, changes nothing
+cleanup --clean          # list every change, then: yes to all / one by one / cancel
+cleanup --clean --dry-run
+cleanup --recover        # put back an archived batch
+cleanup --purge          # permanently free archived batches
+cleanup --help           # every option
+```
+
+- **Storage:** caches, old build folders (`target/`, `node_modules`), `/tmp`, apt, journal, snap and Docker. `--deep` also finds files over 1 GiB.
+- **RAM:** page cache, swap and the biggest apps.
+- **Claude memory:** broken or dangling `MEMORY.md` indexes and stale or duplicate notes.
+- **Plan first:** clean lists every change with its risk (`needs sudo`, `quits the running app`, `CANNOT be undone`) before asking once.
+- **Undo:** removed files are moved to `~/.cleanup-trash/<batch>/`, not deleted. `cleanup --recover <batch>` restores them, and `cleanup --purge` frees the space for good.
+- **Running apps:** quitting an app is never part of "clean all". It is only offered from the RAM apps category, and a quit app can be relaunched from `--recover`.
+
 ## The old scripts
 
 The previous `server-script.sh` is in [legacy/](legacy/) for reference and is no longer maintained. It can lock you out (it replaces `AllowUsers` and changes the SSH port with no way back), so use `server-setup` instead. A machine set up with it is recognised, and its settings are imported the first time you run `server-setup setup`.
