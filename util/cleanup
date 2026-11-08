@@ -1,0 +1,1715 @@
+#!/usr/bin/env python3
+"""cleanup: scan, clean and recover disk space, RAM and Claude Code memory.
+
+Run with no arguments for a menu. Run `cleanup --help` for every option.
+Nothing is changed by a scan. Clean always keeps a way back under ~/.cleanup-trash/.
+"""
+
+# How this file is organised (top to bottom):
+# 1. Constants and the two data classes (Memory = one note, Finding = one result).
+# 2. Claude memory checks: parse notes, find their project, scan each memory folder.
+# 3. Shared helpers, then the storage, Docker and RAM scanners.
+# 4. Archive and fix: move things to ~/.cleanup-trash, apply fixes, recover, purge.
+# 5. Command line, categories, tables and report, the clean flow, menu and main().
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+# Home folder, and the archive folder where cleaned items are kept so they can be undone.
+HOME = Path.home()
+TRASH = HOME / ".cleanup-trash"
+INDEX = "MEMORY.md"
+# Limits and valid note types used when judging Claude memory notes.
+INDEX_MAX_LINES = 200  # Claude Code truncates MEMORY.md after about this many lines
+VALID_TYPES = {"user", "feedback", "project", "reference"}
+# Patterns for [[links]] between notes, index lines '- [title](file)', and `~/paths` in notes.
+LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+INDEX_LINE_RE = re.compile(r"^\s*-\s*\[([^\]]*)\]\(([^)]+)\)")
+PATH_RE = re.compile(r"`((?:~|/home/)[^`\s]+)`")
+# Words that hint a project note is time-bound and may be out of date.
+STALE_WORDS = re.compile(r"\b(resume point|stopped|until|for now|temporar|tonight|tomorrow|this week|blocked on)\b", re.I)
+
+# Severity ranking (lower number = more important) and terminal colour codes for each level.
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
+COLORS = {"high": "\033[31m", "medium": "\033[33m", "low": "\033[36m", "info": "\033[2m"}
+RESET = "\033[0m"
+
+
+# One Claude memory note (a .md file): its frontmatter fields, body text and last-change time.
+@dataclass
+class Memory:
+    path: Path
+    name: str = ""
+    description: str = ""
+    type: str = ""
+    body: str = ""
+    has_frontmatter: bool = False
+    mtime: float = 0.0
+
+
+# One result of a scan: what is wrong or what can be freed, plus an optional machine fix.
+# A finding with an empty `fix` is report-only; `clean` can only act on findings that have one.
+@dataclass
+class Finding:
+    severity: str
+    kind: str
+    where: str
+    message: str
+    action: str  # human recommendation
+    fix: dict = field(default_factory=dict)  # machine action for --clean; empty = manual only
+    module: str = "claude"  # storage | ram | claude
+    size: int = 0  # bytes you could free (storage) or hold (ram)
+    recover: str = ""  # quarantine | regenerates | relaunch | reinstall | irreversible
+    risk: str = ""  # sudo | terminate: always asks, even with -y
+    sensitive: bool = False  # folder holds secret-looking files
+
+
+# ---------------------------------------------------------------- parsing
+
+
+# Read one note file and split off its '---' frontmatter block (name, description, type).
+# Notes without frontmatter still load; they just have empty fields and has_frontmatter=False.
+def parse_memory(path: Path) -> Memory:
+    text = path.read_text(errors="replace")
+    mem = Memory(path=path, mtime=path.stat().st_mtime)
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            mem.has_frontmatter = True
+            for line in text[4:end].splitlines():
+                m = re.match(r"^\s*(name|description|type)\s*:\s*(.*)$", line)
+                if m:
+                    val = m.group(2).strip().strip('"').strip("'")
+                    if not getattr(mem, m.group(1)):
+                        setattr(mem, m.group(1), val)
+            text = text[end + 4 :]
+    mem.body = text.strip()
+    return mem
+
+
+def parse_index(path: Path) -> list[tuple[int, str, str]]:
+    """(line number, title, target file) for each index line."""
+    if not path.exists():
+        return []
+    out = []
+    for i, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        m = INDEX_LINE_RE.match(line)
+        if m:
+            out.append((i, m.group(1), m.group(2).strip()))
+    return out
+
+
+# ------------------------------------------------------- project location
+
+
+def resolve_project_path(encoded: str) -> Path | None:
+    """Turn '-home-x-LAB-tbo-platform' back into a real folder, if one still exists.
+
+    Claude Code encodes the cwd by replacing every non-alphanumeric character with '-',
+    so we walk the filesystem and match child names under the same encoding.
+    """
+    target = encoded.lstrip("-")
+
+    # Same encoding Claude Code uses for folder names: anything not a letter or digit becomes
+    # '-'.
+    def enc(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]", "-", s)
+
+    # Depth-first search: match the encoded name piece by piece against real child folders.
+    def walk(base: Path, rest: str) -> Path | None:
+        if not rest:
+            return base
+        try:
+            children = [c for c in base.iterdir() if c.is_dir()]
+        except OSError:
+            return None
+        # longest names first, so 'tbo-platform' wins over 'tbo'
+        for c in sorted(children, key=lambda c: -len(c.name)):
+            e = enc(c.name)
+            if rest == e:
+                return c
+            if rest.startswith(e + "-"):
+                hit = walk(c, rest[len(e) + 1 :])
+                if hit:
+                    return hit
+        return None
+
+    return walk(Path("/"), target)
+
+
+# Ask the newest session logs for the real working folder (more exact than guessing from the
+# name).
+def session_cwd(project_dir: Path) -> str | None:
+    for f in sorted(project_dir.glob("*.jsonl"), key=lambda p: -p.stat().st_mtime)[:3]:
+        try:
+            with f.open(errors="replace") as fh:
+                for _, line in zip(range(50), fh):
+                    m = re.search(r'"cwd"\s*:\s*"([^"]+)"', line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+    return None
+
+
+# Encode a folder path the way Claude Code names its project folders.
+def project_for_cwd(cwd: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+# ---------------------------------------------------------------- checks
+
+
+# Text likeness from 0 to 1, ignoring case. Used to spot near-duplicate notes.
+def similar(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+# Shorten a path for display by writing the home folder as '~'.
+def short(p: Path) -> str:
+    s = str(p)
+    return "~" + s[len(str(HOME)) :] if s.startswith(str(HOME)) else s
+
+
+# Check one project's memory folder and return its findings plus its parsed notes.
+# Checks run in order: project gone, index health, per-note problems, duplicates, [[links]].
+def scan_memory_dir(mdir: Path, stale_days: int) -> tuple[list[Finding], dict[str, Memory]]:
+    findings: list[Finding] = []
+    where = short(mdir)
+    project_dir = mdir.parent
+    files = sorted(p for p in mdir.iterdir() if p.is_file())
+    mds = [p for p in files if p.suffix == ".md" and p.name != INDEX]
+    others = [p for p in files if p.suffix != ".md"]
+
+    # project folder gone?
+    real = session_cwd(project_dir)
+    real_path = Path(real) if real else resolve_project_path(project_dir.name)
+    if real_path is None or not real_path.exists():
+        guess = real or project_dir.name
+        if mds:
+            findings.append(Finding("high", "orphan-project", where,
+                f"project folder no longer exists ({guess}); {len(mds)} memories nobody will load",
+                "archive the memory folder (or move it to the project's new location)",
+                {"op": "trash", "path": str(mdir)}))
+        elif not files:
+            findings.append(Finding("low", "orphan-project", where,
+                f"project folder gone ({guess}) and memory folder empty",
+                "remove the empty memory folder", {"op": "rmdir", "path": str(mdir)}))
+
+    if not files:
+        if not any(f.kind == "orphan-project" for f in findings):
+            findings.append(Finding("info", "empty", where, "memory folder is empty",
+                "nothing to do (Claude Code recreates it); remove if you want it tidy",
+                {"op": "rmdir", "path": str(mdir)}))
+        return findings, {}
+
+    for p in others:
+        findings.append(Finding("low", "stray-file", short(p), "non-markdown file in a memory folder",
+            "move it out or archive it", {"op": "trash", "path": str(p)}))
+
+    mems = {p.name: parse_memory(p) for p in mds}
+    index_path = mdir / INDEX
+    index = parse_index(index_path)
+    indexed = {t for _, _, t in index}
+
+    # index health
+    if mds and not index_path.exists():
+        findings.append(Finding("high", "no-index", where, f"{len(mds)} memories but no {INDEX}; none will load",
+            f"rebuild {INDEX} from the files' descriptions", {"op": "rebuild-index", "dir": str(mdir)}))
+    if index_path.exists():
+        n_lines = len(index_path.read_text(errors="replace").splitlines())
+        if n_lines > INDEX_MAX_LINES:
+            findings.append(Finding("high", "index-too-long", short(index_path),
+                f"{n_lines} lines (> {INDEX_MAX_LINES}); the tail is cut off when loaded",
+                "merge or archive old memories to shorten the index"))
+        seen: dict[str, int] = {}
+        for ln, title, target in index:
+            if target in seen:
+                findings.append(Finding("medium", "index-duplicate", f"{short(index_path)}:{ln}",
+                    f"'{target}' listed twice (also line {seen[target]})", "remove the duplicate line",
+                    {"op": "drop-index-line", "index": str(index_path), "line": ln}))
+            seen.setdefault(target, ln)
+            if not (mdir / target).exists():
+                findings.append(Finding("high", "index-dangling", f"{short(index_path)}:{ln}",
+                    f"points to missing file '{target}' ({title})", "remove the index line",
+                    {"op": "drop-index-line", "index": str(index_path), "line": ln}))
+        for line in index_path.read_text(errors="replace").splitlines():
+            if len(line) > 250:
+                findings.append(Finding("low", "index-verbose", short(index_path),
+                    f"index line of {len(line)} chars: '{line[:60]}...'",
+                    "keep index lines to a short hook; detail belongs in the file"))
+
+    for fname, m in mems.items():
+        loc = short(m.path)
+        if index_path.exists() and fname not in indexed:
+            findings.append(Finding("high", "unindexed", loc, "not listed in MEMORY.md, so never loaded",
+                "add an index line (or archive the file if it is no longer true)",
+                {"op": "add-index-line", "index": str(index_path), "file": fname,
+                 "title": m.name or fname[:-3], "hook": m.description}))
+        missing = [k for k in ("name", "description", "type") if not getattr(m, k)]
+        if not m.has_frontmatter:
+            findings.append(Finding("medium", "no-frontmatter", loc, "no frontmatter block",
+                "add name / description / metadata.type frontmatter"))
+        elif missing:
+            findings.append(Finding("medium", "frontmatter-missing", loc, f"frontmatter lacks {', '.join(missing)}",
+                "fill in the missing fields"))
+        if m.type and m.type not in VALID_TYPES:
+            findings.append(Finding("low", "bad-type", loc, f"type '{m.type}' is not one of {sorted(VALID_TYPES)}",
+                "fix the type"))
+        if len(m.body) < 40:
+            findings.append(Finding("medium", "thin", loc, f"body is only {len(m.body)} chars",
+                "flesh it out or archive it", {"op": "trash", "path": str(m.path)}))
+        if m.type in ("feedback", "project") and m.body and "**Why:**" not in m.body:
+            findings.append(Finding("info", "no-why", loc, "feedback/project memory without a **Why:** line",
+                "add the reason so it can be judged later"))
+        age = (time.time() - m.mtime) / 86400
+        if m.type == "project" and age > stale_days:
+            findings.append(Finding("medium", "stale", loc, f"project memory untouched for {age:.0f} days",
+                "check it is still true; update or archive", {"op": "trash", "path": str(m.path)}))
+        elif m.type == "project" and STALE_WORDS.search(m.body or m.description):
+            w = STALE_WORDS.search(m.body or m.description).group(0)
+            findings.append(Finding("low", "time-bound", loc,
+                f"reads as time-bound ('{w}'), {age:.0f} days old", "check whether it has expired",
+                {"op": "trash", "path": str(m.path)}))
+        for ref in PATH_RE.findall(m.body):
+            p = Path(os.path.expanduser(ref.rstrip(".,;:)")))
+            if not p.exists() and "<" not in ref and "*" not in ref:
+                findings.append(Finding("low", "dead-path", loc, f"mentions a path that no longer exists: {ref}",
+                    "update the path or archive the memory"))
+
+    # duplicates within the folder
+    names: dict[str, str] = {}
+    for fname, m in mems.items():
+        if m.name and m.name in names:
+            findings.append(Finding("high", "duplicate-name", short(m.path),
+                f"same name '{m.name}' as {names[m.name]}", "merge the two files"))
+        names.setdefault(m.name, fname)
+    items = list(mems.values())
+    for i, a in enumerate(items):
+        for b in items[i + 1 :]:
+            d = similar(a.description, b.description) if a.description and b.description else 0
+            body = similar(a.body[:1500], b.body[:1500])
+            if d > 0.7 or body > 0.6:
+                findings.append(Finding("medium", "near-duplicate", where,
+                    f"{a.path.name} ~ {b.path.name} (description {d:.0%}, body {body:.0%})",
+                    "merge into one file and drop the other"))
+
+    # broken [[links]] are allowed by the convention; report as info
+    all_names = {m.name for m in mems.values()}
+    for m in mems.values():
+        for link in set(LINK_RE.findall(m.body)):
+            if link not in all_names:
+                findings.append(Finding("info", "open-link", short(m.path),
+                    f"[[{link}]] has no memory yet", "write it if it matters, else ignore"))
+    return findings, mems
+
+
+def scan_cross_home(groups: dict[str, dict[str, dict[str, Memory]]]) -> list[Finding]:
+    """Same project in several ~/.claude* homes: flag copies and drift."""
+    out = []
+    for project, by_home in groups.items():
+        homes = [h for h, mems in by_home.items() if mems]
+        if len(homes) < 2:
+            continue
+        for i, ha in enumerate(homes):
+            for hb in homes[i + 1 :]:
+                for a in by_home[ha].values():
+                    for b in by_home[hb].values():
+                        s = similar(a.body[:1500], b.body[:1500])
+                        same_name = a.name and a.name == b.name
+                        if s > 0.95:
+                            out.append(Finding("info", "cross-home-copy", project,
+                                f"{ha}/{a.path.name} = {hb}/{b.path.name}", "fine if you want both accounts to know it"))
+                        elif same_name or s > 0.6:
+                            newer, older = (a, b) if a.mtime >= b.mtime else (b, a)
+                            out.append(Finding("medium", "cross-home-drift", project,
+                                f"{short(older.path)} differs from newer {short(newer.path)} ({s:.0%} alike)",
+                                "copy the newer version over the older (or merge by hand)",
+                                {"op": "copy", "src": str(newer.path), "dst": str(older.path)}))
+    return out
+
+
+# Find the Claude config homes to scan: the ones given with --home, else every ~/.claude*.
+def find_homes(explicit: list[str] | None) -> list[Path]:
+    if explicit:
+        return [Path(os.path.expanduser(h)) for h in explicit]
+    return sorted(p for p in HOME.glob(".claude*") if (p / "projects").is_dir())
+
+
+def key(prompt: str, default: str = "") -> str:
+    """Read one key without Enter (falls back to a line when not on a terminal). Ctrl-C/Ctrl-D raise KeyboardInterrupt (handled in main)."""
+    print(prompt, end="", flush=True)
+    if not sys.stdin.isatty():
+        return (sys.stdin.readline().strip().lower()[:1]) or default
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    if ch in ("\x03", "\x04", ""):
+        raise KeyboardInterrupt
+    ch = default if ch in ("\r", "\n") else ch.lower()
+    print(ch)
+    return ch
+
+
+# ------------------------------------------------------------ shared helpers
+
+
+# Format a byte count for people, e.g. 1536 -> '1.5 KiB'.
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return str(n)
+
+
+# Run a command and return the result, or None if it is missing or times out. Never raises.
+def run(argv: list[str], timeout: int = 60, sudo: bool = False) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run((["sudo"] if sudo else []) + argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+# Disk space used by a folder in bytes (stays on one filesystem). Returns 0 if du fails.
+def du(path: Path, timeout: int = 120) -> int:
+    r = run(["du", "-sb", "--one-file-system", str(path)], timeout)
+    try:
+        return int(r.stdout.split()[0]) if r and r.stdout else 0
+    except (ValueError, IndexError):
+        return 0
+
+
+# Print a progress message to stderr so it does not mix with --json output on stdout.
+def note(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# Build the standard storage Finding: its fix is 'move to the archive', which can be undone.
+# `regen` says how it comes back (regenerates / quarantine / ...).
+def storage_finding(sev: str, kind: str, path: Path, size: int, msg: str, regen: str, **kw) -> Finding:
+    return Finding(sev, kind, short(path), f"{human(size)}: {msg}", "move it to the cleanup archive (undoable); purge later to free the space",
+                   {"op": "trash", "path": str(path)}, module="storage", size=size, recover=regen, **kw)
+
+
+# ------------------------------------------------------------ storage module
+
+# (folder under ~/.cache, why it is safe, browser process to check)
+KNOWN_CACHES = {
+    "uv": ("uv download cache, refilled on the next uv sync", ""),
+    "pip": ("pip cache", ""),
+    "go-build": ("Go build cache", ""),
+    "yarn": ("yarn cache", ""),
+    "node-gyp": ("node-gyp headers", ""),
+    "pre-commit": ("pre-commit environments, rebuilt on next run", ""),
+    "ms-playwright": ("Playwright browsers; `npx playwright install` brings them back", ""),
+    "puppeteer": ("Puppeteer browsers, downloaded again on demand", ""),
+    "tracker3": ("GNOME file index, rebuilt in the background", ""),
+    "thumbnails": ("image thumbnails", ""),
+    "mesa_shader_cache": ("GPU shader cache", ""),
+    "BraveSoftware": ("Brave browser cache", "brave"),
+    "google-chrome": ("Chrome browser cache", "chrome"),
+    "huggingface": ("downloaded models; re-download can be slow", ""),
+}
+# Tool caches outside ~/.cache: (folder, label).
+TOOL_CACHES = [
+    (Path("~/.npm/_cacache"), "npm cache"),
+    (Path("~/.cargo/registry/cache"), "cargo downloaded crates"),
+    (Path("~/.cargo/registry/src"), "cargo unpacked crate sources"),
+    (Path("~/.gradle/caches"), "Gradle caches"),
+    (Path("~/.bun/install/cache"), "bun install cache"),
+    (Path("~/.pub-cache/hosted"), "Dart/Flutter pub packages"),
+]
+# Ignore caches below 200 MiB and build folders below 100 MiB; not worth listing.
+CACHE_MIN = 200 * 1024**2
+ARTIFACT_MIN = 100 * 1024**2
+
+
+# True if a process with exactly this name is running (used to skip a browser's cache while
+# open).
+def proc_running(name: str) -> bool:
+    r = run(["pgrep", "-x", name], 5)
+    return bool(r and r.returncode == 0)
+
+
+# Look for reclaimable disk space: caches, old build folders, old /tmp files, then the
+# system and Docker scanners. Only reports; nothing is changed here.
+def scan_storage(deep: bool, artifact_days: int) -> list[Finding]:
+    out: list[Finding] = []
+    note("storage: caches...")
+    cache = HOME / ".cache"
+    if cache.is_dir():
+        for child in sorted(cache.iterdir()):
+            if not child.is_dir() or child.is_symlink():
+                continue
+            size = du(child)
+            if size < CACHE_MIN:
+                continue
+            why, proc = KNOWN_CACHES.get(child.name, ("", ""))
+            if not why and time.time() - child.stat().st_mtime < 3 * 86400:
+                out.append(Finding("low", "cache-recent", short(child), f"{human(size)}: unrecognised folder changed in the last 3 days, may be in use",
+                                   "left alone; scan again later", module="storage", size=size))
+                continue
+            if proc and (proc_running(proc) or proc_running(proc + "-browser")):
+                out.append(Finding("low", "cache-in-use", short(child), f"{human(size)}: {why}; the browser is running",
+                                   "close it, then scan again", module="storage", size=size))
+                continue
+            if why:
+                out.append(storage_finding("low", "cache", child, size, why, "regenerates"))
+            else:
+                out.append(storage_finding("low", "cache-unknown", child, size,
+                    "folder not recognised (looks like a build or session scratch area); you decide, the archive lets you undo",
+                    "quarantine"))
+    for path, label in TOOL_CACHES:
+        p = path.expanduser()
+        if p.is_dir():
+            size = du(p)
+            if size >= 100 * 1024**2:
+                out.append(storage_finding("low", "tool-cache", p, size, label, "regenerates"))
+    trash = HOME / ".local/share/Trash"
+    if trash.is_dir():
+        size = du(trash)
+        if size >= 50 * 1024**2:
+            out.append(Finding("low", "desktop-trash", short(trash), f"{human(size)}: files you already deleted in the file manager",
+                "empty it (permanent)", {"op": "rm", "path": str(trash), "keep_dir": True},
+                module="storage", size=size, recover="irreversible"))
+
+    note("storage: project build folders...")
+    lab = HOME / "LAB"
+    cutoff = time.time() - artifact_days * 86400
+    if lab.is_dir():
+        # Walk ~/LAB looking for Rust target/ and node_modules folders. Skip git and venv
+        # folders.
+        # A folder only counts if its project file sits beside it (Cargo.toml / package.json).
+        for root, dirs, _files in os.walk(lab):
+            depth = len(Path(root).relative_to(lab).parts)
+            keep = []
+            for d in dirs:
+                full = Path(root) / d
+                if d in (".git", ".history", ".venv", "venv"):
+                    continue
+                marker = {"target": "Cargo.toml", "node_modules": "package.json"}.get(d)
+                if marker and (Path(root) / marker).exists() and not full.is_symlink():
+                    try:
+                        if full.stat().st_mtime < cutoff:
+                            size = du(full)
+                            if size >= ARTIFACT_MIN:
+                                age = (time.time() - full.stat().st_mtime) / 86400
+                                out.append(storage_finding("low", "build-artifacts", full, size,
+                                    f"{'Rust target' if d == 'target' else 'node_modules'} unused for {age:.0f} days; rebuilt by cargo/npm", "regenerates"))
+                    except OSError:
+                        pass
+                    continue  # do not descend
+                # Do not go deeper than 6 levels, to keep the scan quick.
+                if depth < 6:
+                    keep.append(d)
+            dirs[:] = keep
+
+    note("storage: /tmp...")
+    tmp_cut = time.time() - 7 * 86400
+    for child in Path("/tmp").iterdir() if Path("/tmp").is_dir() else []:
+        try:
+            st = child.lstat()
+            if st.st_uid != os.getuid() or child.name.startswith(("claude-", ".X", "systemd-", "snap-", "tracker")) or st.st_mtime > tmp_cut:
+                continue
+            size = du(child) if child.is_dir() and not child.is_symlink() else st.st_size
+            if size >= 50 * 1024**2:
+                out.append(storage_finding("low", "tmp-old", child, size, "your file in /tmp, untouched for over 7 days", "quarantine"))
+        except OSError:
+            pass
+
+    out += scan_system()
+    out += scan_docker()
+    if deep:
+        note("storage: large files (deep)...")
+        r = run(["find", str(HOME), "-xdev", "-type", "f", "-size", "+1G", "-not", "-path", f"{HOME}/.cache/*",
+                 "-not", "-path", f"{HOME}/.local/share/Trash/*", "-printf", "%s\t%p\n"], 180)
+        for line in sorted((r.stdout if r else "").splitlines(), key=lambda s: -int(s.split("\t")[0]))[:15]:
+            size, p = line.split("\t", 1)
+            out.append(Finding("info", "large-file", short(Path(p)), f"{human(int(size))}", "review by hand; nothing is offered automatically",
+                               module="storage", size=int(size)))
+    return out
+
+
+# Find system-level space users (apt cache, journal, old snaps, flatpak). All need sudo or a
+# command.
+def scan_system() -> list[Finding]:
+    out: list[Finding] = []
+    note("storage: system (apt, journal, snap)...")
+    if shutil.which("apt-get") and Path("/var/cache/apt/archives").is_dir():
+        size = du(Path("/var/cache/apt"))
+        if size >= 100 * 1024**2:
+            out.append(Finding("low", "apt-cache", "/var/cache/apt", f"{human(size)}: downloaded .deb files",
+                "sudo apt-get clean", {"op": "cmd", "argv": ["apt-get", "clean"], "sudo": True},
+                module="storage", size=size, recover="regenerates", risk="sudo"))
+    r = run(["journalctl", "--disk-usage"], 15)
+    m = re.search(r"take up ([\d.]+)([KMGT])", r.stdout) if r else None
+    if m:
+        size = int(float(m.group(1)) * 1024 ** ("KMGT".index(m.group(2)) + 1))
+        if size >= 1024**3:
+            out.append(Finding("low", "journal", "systemd journal", f"{human(size)} of logs",
+                "keep the newest 500 MiB: sudo journalctl --vacuum-size=500M",
+                {"op": "cmd", "argv": ["journalctl", "--vacuum-size=500M"], "sudo": True},
+                module="storage", size=max(0, size - 500 * 1024**2), recover="irreversible", risk="sudo"))
+    if shutil.which("snap"):
+        r = run(["snap", "list", "--all"], 20)
+        old = [ln.split() for ln in (r.stdout if r else "").splitlines() if "disabled" in ln]
+        if old:
+            out.append(Finding("low", "snap-old", "snap", f"{len(old)} disabled old snap revisions (the previous versions kept after updates)",
+                "remove them one by one with: sudo snap remove NAME --revision=N (snap saves the user data first; `snap restore` can bring it back)",
+                {"op": "cmd", "argv": ["sh", "-c", "snap list --all | awk '/disabled/{print $1, $3}' | while read n r; do snap remove \"$n\" --revision=\"$r\"; done"],
+                 "sudo": True}, module="storage", recover="reinstall", risk="sudo"))
+    if shutil.which("flatpak"):
+        r = run(["flatpak", "uninstall", "--unused", "--assumeno"], 30)
+        if r and "Uninstall complete" not in (r.stdout or "") and re.search(r"^\s*\d+\.", r.stdout or "", re.M):
+            out.append(Finding("low", "flatpak-unused", "flatpak", "unused flatpak runtimes", "flatpak uninstall --unused",
+                {"op": "cmd", "argv": ["flatpak", "uninstall", "--unused", "-y"], "sudo": False},
+                module="storage", recover="reinstall"))
+    return out
+
+
+# --------------------------------------------------------------- docker
+
+
+def protected_refs() -> tuple[set[str], set[str]]:
+    """sha256 hex strings and image refs that TBO releases pin (current, previous, history)."""
+    hexes: set[str] = set()
+    refs: set[str] = set()
+    files: list[Path] = []
+    for sub in ("releases",):
+        d = HOME / "tbo" / sub
+        if d.is_dir():
+            files += [p for p in d.rglob("*") if p.is_file()]
+    for f in set(files):
+        try:
+            if f.is_file() and f.stat().st_size < 5_000_000:
+                text = f.read_text(errors="replace")
+                hexes.update(re.findall(r"[0-9a-f]{64}", text))
+                refs.update(re.findall(r"[\w./-]+(?::[\w.-]+)?@sha256:[0-9a-f]{64}|[\w.-]+(?:/[\w.-]+)+:[\w.-]+", text))
+        except OSError:
+            pass
+    return hexes, refs
+
+
+# Find old Docker images that are safe to remove, plus reclaimable build cache.
+# An image is skipped if any container uses it or a TBO release pins it. Volumes are never
+# touched.
+def scan_docker() -> list[Finding]:
+    out: list[Finding] = []
+    if not shutil.which("docker"):
+        return out
+    note("storage: docker...")
+    r = run(["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{json .}}"], 60)
+    if not r or r.returncode != 0:
+        return [Finding("info", "docker-unavailable", "docker", "docker not reachable (daemon down or no permission)", "skip", module="storage")]
+    hexes, refs = protected_refs()
+    used: set[str] = set()
+    cr = run(["docker", "ps", "-aq"], 30)
+    ids = (cr.stdout.split() if cr else [])
+    if ids:
+        ir = run(["docker", "inspect", "--format", "{{.Image}}", *ids], 60)
+        used = {x.replace("sha256:", "") for x in (ir.stdout.split() if ir else [])}
+    insp = run(["docker", "image", "inspect", "--format",
+                "{{.Id}}\t{{.Size}}\t{{.Created}}\t{{join .RepoTags \",\"}}\t{{join .RepoDigests \",\"}}",
+                *[json.loads(x)["ID"] for x in r.stdout.splitlines() if x.strip()]], 120)
+    reclaim = 0
+    for line in (insp.stdout if insp else "").splitlines():
+        iid, size, created, tags, digests = (line.split("\t") + [""] * 5)[:5]
+        hexid = iid.replace("sha256:", "")
+        dig_hex = set(re.findall(r"[0-9a-f]{64}", digests))
+        tag_list = [t for t in tags.split(",") if t]
+        if hexid in used or hexid in hexes or dig_hex & hexes or dig_hex & used:
+            continue
+        if any(t in refs for t in tag_list) or any(d in refs for d in digests.split(",")):
+            continue
+        try:
+            age = (time.time() - time.mktime(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))) / 86400
+        except ValueError:
+            age = 0
+        if age < 7:
+            continue
+        sz = int(size or 0)
+        reclaim += sz
+        label = ", ".join(tag_list) or ("<untagged> " + (digests.split(",")[0] if digests else hexid[:12]))
+        out.append(Finding("low", "docker-image", f"docker image {hexid[:12]}",
+            f"{human(sz)} (shared layers may free less): {label}, {age:.0f} days old, no container, not pinned by ~/tbo releases",
+            "save it to the archive (docker save), then remove the image; undo with `cleanup --recover` (docker load)",
+            {"op": "docker-rmi", "id": iid, "label": label, "tags": tag_list, "bytes": sz}, module="storage", size=sz, recover="quarantine"))
+    out.sort(key=lambda f: -f.size)
+    r = run(["docker", "system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"], 60)
+    for ln in (r.stdout if r else "").splitlines():
+        t, rec = (ln.split("\t") + [""])[:2]
+        if t == "Build Cache" and rec and not rec.startswith("0B"):
+            out.append(Finding("low", "docker-build-cache", "docker build cache", f"{rec} reclaimable (unused for over a week)",
+                "docker builder prune --filter until=168h",
+                {"op": "cmd", "argv": ["docker", "builder", "prune", "-f", "--filter", "until=168h"], "sudo": False},
+                module="storage", recover="regenerates"))
+    out.append(Finding("info", "docker-policy", "docker", "images pinned by ~/tbo/releases (current and previous), images used by any container, and all volumes are never offered",
+        "volumes hold data: review them by hand with `docker volume ls`", module="storage"))
+    return out
+
+
+# ------------------------------------------------------------------ RAM
+
+# Process names we never offer to quit (system, shells, databases, dev tools).
+# Matched against the whole name with this pattern.
+PROTECTED_PROC = re.compile(
+    r"^(systemd|init|Xorg|Xwayland|gnome-.*|gdm.*|dbus.*|pipewire.*|pulseaudio|wireplumber|sshd|tmux.*|screen|dockerd|containerd.*|docker.*|"
+    r"postgres.*|redis.*|temporal.*|keycloak.*|caddy|java|NetworkManager|snapd|cron|bash|zsh|fish|sh|login|sudo|"
+    r"tbo.*|claude|codex|node|python.*|ibus.*|polkit.*|udisks.*|cleanup)$")
+
+
+# Read /proc/meminfo into a dict of name -> bytes.
+def meminfo() -> dict[str, int]:
+    out = {}
+    for ln in Path("/proc/meminfo").read_text().splitlines():
+        k, v = ln.split(":", 1)
+        out[k] = int(v.split()[0]) * 1024
+    return out
+
+
+# PIDs of this program and its parents, so we never offer to quit the terminal we run in.
+def ancestors() -> set[int]:
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        try:
+            pid = int(re.search(r"PPid:\s+(\d+)", Path(f"/proc/{pid}/status").read_text()).group(1))
+        except (OSError, AttributeError):
+            break
+    return pids
+
+
+# Report memory pressure, then list the biggest app groups (by name) that could be asked to
+# quit.
+# Protected, system and our own processes are shown as info only and never get a fix.
+def scan_ram() -> list[Finding]:
+    out: list[Finding] = []
+    mi = meminfo()
+    total, avail = mi["MemTotal"], mi["MemAvailable"]
+    cache = mi.get("Cached", 0) + mi.get("Buffers", 0)
+    swap_used = mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+    pct_avail = avail / total * 100
+    sev = "high" if pct_avail < 8 else "medium" if pct_avail < 15 or (mi.get("SwapTotal") and swap_used / mi["SwapTotal"] > 0.7) else "low"
+    out.append(Finding(sev, "ram-status", "memory", f"{human(total - avail)} in use of {human(total)}; {human(avail)} available ({pct_avail:.0f}%); "
+        f"swap {human(swap_used)} of {human(mi.get('SwapTotal', 0))} used; page cache {human(cache)}",
+        "free memory by closing the biggest apps below, or drop the page cache", module="ram"))
+    if cache > 4 * 1024**3:
+        out.append(Finding("low", "drop-cache", "page cache", f"{human(cache)} of file cache (the kernel gives it back by itself when apps need RAM)",
+            "sudo sync; drop_caches. Safe but the gain is short-lived",
+            {"op": "cmd", "argv": ["sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"], "sudo": True},
+            module="ram", size=cache, recover="regenerates", risk="sudo"))
+    if mi.get("SwapTotal") and swap_used > 2 * 1024**3:
+        if avail > swap_used * 1.3:
+            out.append(Finding("low", "swap-reclaim", "swap", f"{human(swap_used)} sits in swap and {human(avail)} RAM is free: can pull it back",
+                "sudo swapoff -a && sudo swapon -a (slow, 1 to several minutes, system may stutter)",
+                {"op": "cmd", "argv": ["sh", "-c", "swapoff -a && swapon -a"], "sudo": True}, module="ram", recover="regenerates", risk="sudo"))
+        else:
+            out.append(Finding("info", "swap-heavy", "swap", f"{human(swap_used)} in swap but only {human(avail)} RAM available, so it cannot be pulled back safely",
+                "close apps first, then scan again", module="ram"))
+    # process groups
+    mine = ancestors()
+    groups: dict[str, dict] = {}
+    r = run(["ps", "-u", str(os.getuid()), "-o", "pid=,rss=,stat=,comm="], 15)
+    zombies = 0
+    for ln in (r.stdout if r else "").splitlines():
+        parts = ln.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, rss, stat, comm = int(parts[0]), int(parts[1]) * 1024, parts[2], parts[3].strip()
+        if stat.startswith("Z"):
+            zombies += 1
+            continue
+        g = groups.setdefault(comm, {"rss": 0, "pids": []})
+        g["rss"] += rss
+        g["pids"].append(pid)
+    if zombies:
+        out.append(Finding("info", "zombies", "processes", f"{zombies} zombie process(es) (take no RAM)", "their parent must reap them; restart the parent if the count grows", module="ram"))
+    for comm, g in sorted(groups.items(), key=lambda kv: -kv[1]["rss"])[:8]:
+        if g["rss"] < 300 * 1024**2:
+            continue
+        prot = bool(PROTECTED_PROC.match(comm)) or bool(set(g["pids"]) & mine)
+        msg = f"{human(g['rss'])} across {len(g['pids'])} process(es)"
+        if prot:
+            out.append(Finding("info", "ram-hog", f"{comm}", msg + " (protected: system, service or this session; not offered)", "close it yourself if you want", module="ram", size=g["rss"]))
+        else:
+            out.append(Finding("low", "ram-hog", f"{comm}", msg, f"ask it to quit (SIGTERM); its command lines are saved so `cleanup --recover` can relaunch it",
+                {"op": "terminate", "comm": comm, "pids": g["pids"]}, module="ram", size=g["rss"], recover="relaunch", risk="terminate"))
+    return out
+
+
+# ------------------------------------------------------- archive and fix
+
+# How each recovery kind is explained to the user, and its short tag in tables.
+# DEFAULT_RECOVER covers fix ops that always go through the archive.
+RECOVER_TEXT = {
+    "quarantine": "undo: cleanup --recover",
+    "regenerates": "comes back by itself",
+    "relaunch": "relaunch from --recover",
+    "reinstall": "reinstallable",
+    "irreversible": "CANNOT be undone",
+    "": "",
+}
+SHORT_RECOVER = {"quarantine": "↩ undoable", "regenerates": "♻ regrows", "relaunch": "↩ relaunch", "reinstall": "↩ reinstall", "irreversible": "⚠ FINAL"}
+DEFAULT_RECOVER = {"trash": "quarantine", "drop-index-line": "quarantine", "copy": "quarantine",
+                   "add-index-line": "quarantine", "rebuild-index": "quarantine", "rmdir": "quarantine"}
+
+
+# How a finding can be undone: its own setting, else a default for its operation, else none.
+def recover_kind(f: Finding) -> str:
+    return f.recover or DEFAULT_RECOVER.get(f.fix.get("op", ""), "")
+
+
+# One clean run's archive folder: ~/.cleanup-trash/<timestamp>/ plus a manifest.json
+# listing every change, so --recover knows how to put each item back.
+class Batch:
+    def __init__(self, stamp: str):
+        self.stamp = stamp
+        self.dir = TRASH / stamp
+        self.entries: list[dict] = []
+
+    # Where an original file is stored inside the batch (the same path, kept under the batch
+    # folder).
+    def store_path(self, original: Path, suffix: str = "") -> Path:
+        dest = self.dir / (str(original).lstrip("/") + suffix)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    # Append this run's entries to manifest.json. Called after each item so a crash loses
+    # nothing.
+    def save(self) -> None:
+        if self.entries:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            mf = self.dir / "manifest.json"
+            old = json.loads(mf.read_text()) if mf.exists() else []
+            mf.write_text(json.dumps(old + self.entries, indent=1))
+
+
+# Move a file or folder into the batch instead of deleting it. That is why a clean can be
+# undone.
+# Space is only freed later by purge.
+def trash(path: Path, batch: Batch, module: str) -> Path:
+    size = du(path) if path.is_dir() else path.stat().st_size
+    dest = batch.store_path(path)
+    shutil.move(str(path), dest)
+    batch.entries.append({"type": "file", "module": module, "original": str(path), "stored": str(dest), "bytes": size})
+    return dest
+
+
+# Copy a file into the batch (as .bak) before we edit it, so the old version can be restored.
+def backup(path: Path, batch: Batch) -> Path:
+    dest = batch.store_path(path, ".bak")
+    shutil.copy2(path, dest)
+    batch.entries.append({"type": "file", "module": "claude", "original": str(path), "stored": str(dest), "overwrite": True, "bytes": path.stat().st_size})
+    return dest
+
+
+# Carry out one finding's fix and return a one-line result for the user.
+# `fx["op"]` picks the action. dry=True only describes it. permanent=True skips the archive.
+def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = False) -> str:
+    fx = f.fix
+    op = fx["op"]
+    if dry:
+        return f"[dry run] would {op}: {json.dumps({k: v for k, v in fx.items() if k != 'op'})}"
+    if op == "trash":
+        if permanent:
+            p = Path(fx["path"])
+            shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+            return f"deleted permanently, freed {human(f.size)}"
+        dest = trash(Path(fx["path"]), batch, f.module)
+        return f"archived to {short(dest)}"
+    if op == "rm":
+        p = Path(fx["path"])
+        if fx.get("keep_dir"):
+            for c in p.iterdir():
+                shutil.rmtree(c) if c.is_dir() and not c.is_symlink() else c.unlink()
+        else:
+            shutil.rmtree(p)
+        return "deleted"
+    if op == "rmdir":
+        trash(Path(fx["path"]), batch, f.module)
+        return "archived"
+    if op == "drop-index-line":
+        p = Path(fx["index"])
+        # A dangling index line points to a note file that no longer exists. Back up the index
+        # first.
+        backup(p, batch)
+        lines = p.read_text().splitlines(keepends=True)
+        del lines[fx["line"] - 1]
+        p.write_text("".join(lines))
+        return "line removed (old version archived)"
+    if op == "add-index-line":
+        p = Path(fx["index"])
+        backup(p, batch)
+        text = p.read_text()
+        p.write_text(text + ("" if text.endswith("\n") or not text else "\n") + f"- [{fx['title']}]({fx['file']}) — {fx['hook'] or '(add a one-line hook)'}\n")
+        return "index line added"
+    if op == "rebuild-index":
+        d = Path(fx["dir"])
+        lines = []
+        for md in sorted(d.glob("*.md")):
+            if md.name != INDEX:
+                m = parse_memory(md)
+                lines.append(f"- [{m.name or md.stem}]({md.name}) — {m.description or '(add a hook)'}\n")
+        (d / INDEX).write_text("".join(lines))
+        batch.entries.append({"type": "created", "module": "claude", "original": str(d / INDEX)})
+        return f"{INDEX} written with {len(lines)} lines (undo removes it)"
+    if op == "copy":
+        dst = Path(fx["dst"])
+        backup(dst, batch)
+        shutil.copy2(fx["src"], dst)
+        return "copied (old version archived)"
+    if op == "cmd":
+        # sudo asks for a password, so it cannot run without a terminal.
+        if fx.get("sudo") and not sys.stdin.isatty():
+            return "skipped: needs sudo and a terminal"
+        r = subprocess.run((["sudo"] if fx.get("sudo") else []) + fx["argv"], capture_output=True, text=True)
+        batch.entries.append({"type": "command", "module": f.module, "argv": fx["argv"], "sudo": bool(fx.get("sudo")), "returncode": r.returncode,
+                              "recover": recover_kind(f)})
+        tail = (r.stdout.strip().splitlines() or r.stderr.strip().splitlines() or [""])[-1]
+        return ("done" if r.returncode == 0 else f"failed (exit {r.returncode})") + (f": {tail}" if tail else ".")
+    if op == "docker-rmi":
+        # Save the image to a tar file first. Only remove it if the save worked.
+        tar = batch.store_path(Path("/docker") / (fx["id"].replace("sha256:", "")[:12] + ".tar"))
+        s = subprocess.run(["docker", "save", "-o", str(tar), *(fx.get("tags") or [fx["id"]])], capture_output=True, text=True)
+        if s.returncode != 0:
+            tar.unlink(missing_ok=True)
+            return f"NOT removed: docker save failed ({s.stderr.strip()[:120]})"
+        rm = subprocess.run(["docker", "rmi", fx["id"]], capture_output=True, text=True)
+        batch.entries.append({"type": "docker-image", "module": "storage", "id": fx["id"], "label": fx["label"], "tags": fx.get("tags", []), "stored": str(tar), "bytes": tar.stat().st_size})
+        if rm.returncode != 0:
+            return f"saved to {short(tar)} but docker rmi failed: {rm.stderr.strip()[:120]} (nothing lost; the image is still there)"
+        return f"saved to {short(tar)} and removed (docker load restores it)"
+    if op == "terminate":
+        saved, gone = [], 0
+        # Step 1: remember each process's command line, folder and program so --recover can
+        # relaunch it.
+        for pid in fx["pids"]:
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                exe = os.readlink(f"/proc/{pid}/exe")
+                saved.append({"pid": pid, "argv": [c.decode(errors="replace") for c in cmdline], "cwd": cwd, "exe": exe})
+            except OSError:
+                pass
+        # Step 2: politely ask every process to quit (SIGTERM). We never force-kill.
+        for pid in fx["pids"]:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        # Step 3: wait a moment, then count the ones that exited (a zombie counts as gone).
+        time.sleep(3)
+        for pid in fx["pids"]:
+            try:
+                state = re.search(r"State:\s+(\S)", Path(f"/proc/{pid}/status").read_text()).group(1)
+            except (OSError, AttributeError):
+                state = "Z"
+            if state == "Z":
+                gone += 1
+        # relaunch only the main (first) process of the group; children come back with it
+        main = saved[0] if saved else None
+        batch.entries.append({"type": "process", "module": "ram", "comm": fx["comm"], "relaunch": main, "count": len(fx["pids"])})
+        left = len(fx["pids"]) - gone
+        return f"asked {len(fx['pids'])} process(es) to quit; {gone} gone" + (f", {left} still running (not force-killed)" if left else "")
+    return "unknown op"
+
+
+# ------------------------------------------------------------------- recover
+
+
+# Archive batches, newest first (a batch counts only if it has a manifest).
+def list_batches() -> list[Path]:
+    return sorted((p for p in TRASH.glob("*") if p.is_dir() and (p / "manifest.json").exists()), reverse=True) if TRASH.exists() else []
+
+
+# Read a batch's manifest.json; an unreadable or missing one counts as empty.
+def load_manifest(b: Path) -> list[dict]:
+    try:
+        return json.loads((b / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return []
+
+
+# One-line summary of a batch: name, entry counts by type, and bytes held.
+def batch_summary(b: Path) -> str:
+    es = load_manifest(b)
+    kinds: dict[str, int] = {}
+    for e in es:
+        kinds[e["type"]] = kinds.get(e["type"], 0) + 1
+    size = sum(e.get("bytes", 0) for e in es)
+    return f"{b.name}  {len(es)} entries ({', '.join(f'{n} {k}' for k, n in kinds.items())}), {human(size)} held"
+
+
+# One-line description of a manifest entry, used when listing and when asking to restore.
+def entry_line(e: dict) -> str:
+    t = e["type"]
+    if t == "file":
+        return f"{'overwrite' if e.get('overwrite') else 'file'} {short(Path(e['original']))}"
+    if t == "created":
+        return f"created {short(Path(e['original']))} (undo deletes it)"
+    if t == "docker-image":
+        return f"docker image {e['label']} ({human(e.get('bytes', 0))})"
+    if t == "process":
+        r = e.get("relaunch")
+        return f"process {e['comm']} x{e['count']}" + (f"  relaunch: {' '.join(r['argv'])[:90]}" if r and r['argv'] else "")
+    if t == "command":
+        return f"ran {'sudo ' if e.get('sudo') else ''}{' '.join(e['argv'])[:80]} ({RECOVER_TEXT.get(e.get('recover', ''), '')})"
+    return t
+
+
+# Restore archived items. Pick a batch by prefix, by -y (newest), or from a prompt.
+# Commands that already ran are only listed; they cannot be reversed. Files that are
+# back in place are removed from the manifest; a fully restored batch folder is deleted.
+def recover(batch_arg: str | None, assume_yes: bool) -> int:
+    batches = list_batches()
+    if not batches:
+        print(f"Nothing to recover: {short(TRASH)} holds no archived batches.")
+        return 0
+    if batch_arg:
+        chosen = [b for b in batches if b.name.startswith(batch_arg)]
+        if not chosen:
+            print(f"No batch matching '{batch_arg}'. Batches: {', '.join(b.name for b in batches)}")
+            return 1
+    elif assume_yes:
+        chosen = batches[:1]
+        print(f"-y given: recovering the newest batch ({chosen[0].name}).")
+    elif not sys.stdin.isatty():
+        for i, b in enumerate(batches, 1):
+            print(f"{i}. {batch_summary(b)}")
+        return 0
+    else:
+        print("Archived batches (newest first):")
+        for i, b in enumerate(batches, 1):
+            print(f"  {i}. {batch_summary(b)}")
+        ans = input("Recover which? number, [a]ll, or Enter to cancel: ").strip().lower()
+        if not ans:
+            return 0
+        chosen = batches if ans == "a" else [batches[int(ans) - 1]] if ans.isdigit() and 0 < int(ans) <= len(batches) else []
+        if not chosen:
+            print("Not a valid choice.")
+            return 1
+    restored = 0
+    for b in chosen:
+        remaining = []
+        for e in load_manifest(b):
+            line = entry_line(e)
+            ok = None  # None = not recoverable, True/False = done/failed
+            t = e["type"]
+            if t == "command":
+                print(f"info  {line}")
+                continue
+            if not assume_yes and sys.stdin.isatty():
+                if key(f"restore {line} ? [Y/n] ", "y") == "n":
+                    remaining.append(e)
+                    continue
+            try:
+                if t == "file":
+                    dest, src = Path(e["original"]), Path(e["stored"])
+                    if dest.exists() and not e.get("overwrite"):
+                        print(f"skip {short(dest)}: something exists there now")
+                        remaining.append(e)
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if e.get("overwrite"):
+                        shutil.copy2(src, dest)
+                        src.unlink()
+                    else:
+                        shutil.move(str(src), dest)
+                elif t == "created":
+                    Path(e["original"]).unlink(missing_ok=True)
+                elif t == "docker-image":
+                    r = subprocess.run(["docker", "load", "-i", e["stored"]], capture_output=True, text=True)
+                    if r.returncode != 0:
+                        raise OSError(r.stderr.strip()[:150])
+                    Path(e["stored"]).unlink(missing_ok=True)
+                    if not e.get("tags"):
+                        print("  note: image was untagged; it is back under its ID only (a registry digest reference is not restored)")
+                elif t == "process":
+                    rl = e.get("relaunch")
+                    if not rl or not rl["argv"]:
+                        print(f"cannot relaunch {e['comm']}: command line unknown")
+                        continue
+                    subprocess.Popen(rl["argv"], cwd=rl["cwd"] if Path(rl["cwd"]).is_dir() else None, executable=rl["exe"],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                print(f"restored {line}")
+                restored += 1
+            except OSError as ex:
+                print(f"failed {line}: {ex}")
+                remaining.append(e)
+        if remaining:
+            (b / "manifest.json").write_text(json.dumps(remaining, indent=1))
+        else:
+            shutil.rmtree(b, ignore_errors=True)
+    print(f"{restored} item(s) restored.")
+    return 0
+
+
+# Permanently delete archived batches (all, or older than N days). This is the only step that
+# frees archived space, and it ends --recover for them, so it asks for 'yes' first.
+def purge(days: int | None, assume_yes: bool) -> int:
+    batches = list_batches()
+    cut = time.time() - (days or 0) * 86400
+    old = [b for b in batches if days is None or b.stat().st_mtime < cut]
+    if not old:
+        print("Nothing to purge.")
+        return 0
+    total = 0
+    for b in old:
+        s = du(b)
+        total += s
+        print(f"  {batch_summary(b)}  (on disk: {human(s)})")
+    print(f"Purging frees {human(total)} and makes these changes permanent (no more --recover).")
+    if not assume_yes:
+        if not sys.stdin.isatty() or input("Type 'yes' to purge: ").strip() != "yes":
+            print("Cancelled.")
+            return 0
+    for b in old:
+        shutil.rmtree(b, ignore_errors=True)
+    print("Purged.")
+    return 0
+
+
+# ------------------------------------------------------------------ main
+
+# The three scan modules, in report order, and their headings.
+MODULES = ["storage", "ram", "claude"]
+MODULE_TITLE = {"storage": "STORAGE", "ram": "RAM", "claude": "CLAUDE MEMORY"}
+
+# Long help text shown below the option list in --help.
+EPILOG = """\
+Modules (-m, repeatable; default all):
+  storage   caches, old build folders (target/, node_modules), /tmp, Docker images and build cache,
+            apt cache, journal, snaps, desktop trash   (--deep adds a hunt for files over 1 GiB)
+  ram       memory/swap pressure, page cache, biggest apps you can ask to quit
+  claude    Claude Code memory folders: broken index, stale or duplicate notes (every ~/.claude* account)
+
+Safety:
+  Nothing is removed on a scan. Clean never deletes: it moves files, saves Docker images with
+  `docker save`, and records the command line of quit apps, all under ~/.cleanup-trash/<timestamp>/.
+  `--recover` puts them back (docker load, relaunch). Space is only freed by `--purge`.
+  Items marked "CANNOT be undone" (journal, desktop trash) always need you to type yes.
+  Never offered: Docker volumes, images pinned by ~/tbo releases or used by a container.
+
+Examples:
+  cleanup                         menu
+  cleanup --scan                  report on everything
+  cleanup --scan -m storage       storage only
+  cleanup --clean -m ram          pick apps to quit
+  cleanup --clean --dry-run       show what clean would do, change nothing
+  cleanup --list-trash            show archived batches
+  cleanup --recover               choose a batch to restore
+  cleanup --recover 20261108      restore a batch by name (prefix ok)
+  cleanup --purge 14              permanently free archived batches older than 14 days
+  cleanup --scan -m claude --here only this folder's Claude project memory"""
+
+
+# Define every command line option. Help text and examples live in EPILOG above.
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="cleanup", description="Scan, clean and recover disk space, RAM and Claude memory.",
+                                 epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_argument_group("action (default: menu on a terminal, else scan)")
+    g.add_argument("--scan", action="store_true", help="report findings and recommendations; changes nothing")
+    g.add_argument("--clean", "--fix", dest="clean", action="store_true", help="ask about each fixable finding and apply it with a recovery path")
+    g.add_argument("--dry-run", action="store_true", help="with --clean: print what would happen, change nothing")
+    g.add_argument("--recover", nargs="?", const="", metavar="BATCH", help="restore archived items; without BATCH, choose from a list")
+    g.add_argument("--list-trash", action="store_true", help="list archived batches and their contents")
+    g.add_argument("--purge", nargs="?", const=-1, type=int, metavar="DAYS", help="permanently free archived batches older than DAYS (no value: all)")
+    f = ap.add_argument_group("scope and filters")
+    f.add_argument("-m", "--module", action="append", choices=MODULES, help="module to run (repeatable); default: all")
+    f.add_argument("--deep", action="store_true", help="storage: also search for files over 1 GiB (slower)")
+    f.add_argument("--artifact-days", type=int, default=14, metavar="N", help="storage: target/ and node_modules unused for N days count as old (default 14)")
+    f.add_argument("--here", action="store_true", help="claude: only the project for the current folder")
+    f.add_argument("-p", "--project", metavar="TEXT", help="claude: only projects whose folder name contains TEXT")
+    f.add_argument("--home", action="append", metavar="DIR", help="claude: config home to scan (repeatable); default: every ~/.claude*")
+    f.add_argument("--stale-days", type=int, default=30, metavar="N", help="claude: project memory older than N days is stale (default 30)")
+    f.add_argument("-c", "--category", action="append", choices=list(CATEGORIES), metavar="CAT",
+                   help="show details (and clean only) this category; repeatable. Names: " + ", ".join(CATEGORIES))
+    f.add_argument("--all", action="store_true", help="list every item in the details instead of the top 15 per category")
+    f.add_argument("--min", default="low", choices=list(SEV_ORDER), help="hide findings below this severity (default low)")
+    o = ap.add_argument_group("output")
+    o.add_argument("--json", action="store_true", help="print findings as JSON")
+    o.add_argument("-y", "--yes", action="store_true", help="skip per-item questions for recoverable, non-sudo items; never for irreversible, sudo or quit-app items")
+    return ap
+
+
+# Run the chosen modules and return (findings, stats), already filtered by --min severity
+# and sorted: module, then severity, then biggest size first.
+def collect(args) -> tuple[list[Finding], dict]:
+    mods = args.module or MODULES
+    findings: list[Finding] = []
+    stats = {"folders": 0, "memories": 0}
+    if "storage" in mods:
+        findings += scan_storage(args.deep, args.artifact_days)
+    if "ram" in mods:
+        findings += scan_ram()
+    if "claude" in mods:
+        here = project_for_cwd(Path.cwd()) if args.here else None
+        groups: dict[str, dict[str, dict[str, Memory]]] = {}
+        for home in find_homes(args.home):
+            for mdir in sorted((home / "projects").glob("*/memory")):
+                proj = mdir.parent.name
+                if (here and proj != here) or (args.project and args.project.lower() not in proj.lower()):
+                    continue
+                stats["folders"] += 1
+                fs, mems = scan_memory_dir(mdir, args.stale_days)
+                findings += fs
+                groups.setdefault(proj, {})[home.name] = mems
+        findings += scan_cross_home(groups)
+        stats["memories"] = sum(len(m) for g in groups.values() for m in g.values())
+    mark_sensitive(findings)
+    findings = [f for f in findings if SEV_ORDER[f.severity] <= SEV_ORDER[args.min]]
+    findings.sort(key=lambda f: (MODULES.index(f.module), SEV_ORDER[f.severity], -f.size, f.kind, f.where))
+    return findings, stats
+
+
+# category key -> (title, safety, what it means)
+CATEGORIES = {
+    "caches": ("Known caches (uv, npm, browsers, cargo...)", "safe", "downloaded again on demand"),
+    "scratch": ("Unrecognised ~/.cache folders", "review", "build or session leftovers; you decide"),
+    "build": ("Old build folders (target/, node_modules)", "safe", "rebuilt by cargo or npm"),
+    "tmp": ("Old files in /tmp", "review", "yours, untouched for over 7 days"),
+    "docker": ("Unused Docker images", "review", "saved to the archive before removal"),
+    "dockercache": ("Docker build cache", "safe", "rebuilt by the next build"),
+    "system": ("System caches and old app versions", "safe", "apt cache, old snaps, flatpak runtimes"),
+    "logs": ("System logs (journal)", "caution", "cannot be undone"),
+    "trash": ("Desktop trash", "caution", "already deleted by you; cannot be undone"),
+    "ram-apps": ("Apps using the most RAM", "review", "asking one to quit; it can be relaunched"),
+    "ram-system": ("Kernel memory (page cache, swap)", "safe", "refills by itself"),
+    "mem-broken": ("Claude notes that never load or are broken", "review", "fix the index or front matter"),
+    "mem-dangling": ("Claude memory: dangling (project or file gone)", "review", "nothing points at it any more"),
+    "mem-stale": ("Claude notes: stale or duplicated", "review", "check they are still true"),
+    "mem-tidy": ("Claude notes: style and FYI", "info", "optional"),
+    "notes": ("Notes and protected items", "info", "nothing to do"),
+}
+# Which report category each finding kind falls under (see CATEGORIES above).
+KIND_CATEGORY = {
+    "cache": "caches", "tool-cache": "caches", "cache-unknown": "scratch", "build-artifacts": "build", "tmp-old": "tmp",
+    "docker-image": "docker", "docker-build-cache": "dockercache", "apt-cache": "system", "snap-old": "system",
+    "flatpak-unused": "system", "journal": "logs", "desktop-trash": "trash", "ram-hog": "ram-apps", "drop-cache": "ram-system",
+    "swap-reclaim": "ram-system", "no-index": "mem-broken", "unindexed": "mem-broken", "index-dangling": "mem-broken",
+    "index-duplicate": "mem-broken", "index-too-long": "mem-broken", "duplicate-name": "mem-broken",
+    "frontmatter-missing": "mem-broken", "no-frontmatter": "mem-broken", "bad-type": "mem-broken",
+    "orphan-project": "mem-dangling", "empty": "mem-dangling", "stray-file": "mem-dangling", "dead-path": "mem-dangling",
+    "stale": "mem-stale", "time-bound": "mem-stale", "near-duplicate": "mem-stale", "thin": "mem-stale",
+    "cross-home-drift": "mem-stale",
+}
+# Display labels, icons and colours for the report.
+SAFETY_LABEL = {"safe": "🟢 SAFE", "review": "🟡 REVIEW", "caution": "🔴 CAUTION", "info": "⚪ INFO"}
+MODULE_ICON = {"storage": "📦", "ram": "🧠", "claude": "📝"}
+MODULE_COLOR = {"storage": "\033[1;36m", "ram": "\033[1;35m", "claude": "\033[1;34m"}
+SAFETY_COLOR = {"safe": "\033[32m", "review": "\033[33m", "caution": "\033[31m", "info": "\033[2m"}
+# Keys given to categories in order, so a category can be opened with one key press.
+HOTKEYS = "123456789bdefghijklmnoprstuvwxyz"
+# File names that look like secrets (.env, keys, tokens). Used only to warn, never to read
+# content.
+SECRET_NAMES = re.compile(r"(^\.env($|\.)|id_(rsa|ed25519|ecdsa)|\.pem$|\.p12$|\.pfx$|\.key$|credentials|\.git-credentials|\.netrc|token|secret|\.kdbx$)", re.I)
+
+
+# Which report category a finding belongs to; unknown kinds fall back by module.
+def cat_of(f: Finding) -> str:
+    return KIND_CATEGORY.get(f.kind, "mem-tidy" if f.module == "claude" else "notes")
+
+
+def has_secrets(path: Path, cap: int = 4000) -> bool:
+    """Cheap look for secret-looking file names inside a folder we are about to archive."""
+    n = 0
+    try:
+        if path.is_file():
+            return bool(SECRET_NAMES.search(path.name))
+        for _root, _dirs, files in os.walk(path):
+            for name in files:
+                n += 1
+                if SECRET_NAMES.search(name):
+                    return True
+            if n > cap:
+                break
+    except OSError:
+        pass
+    return False
+
+
+# Flag cleanup candidates whose folder contains secret-looking file names (warning only).
+def mark_sensitive(findings: list[Finding]) -> None:
+    for f in findings:
+        if f.kind in ("cache-unknown", "tmp-old") and f.fix.get("path"):
+            f.sensitive = has_secrets(Path(f.fix["path"]))
+
+
+def bar(parts: list[tuple[float, str]], width: int, on: bool) -> str:
+    """Segmented bar: parts are (fraction of the whole, colour); the rest is empty."""
+    out, used = "", 0
+    for frac, code in parts:
+        n = min(width - used, round(max(0.0, frac) * width))
+        if frac > 0 and n == 0 and used < width:
+            n = 1  # keep tiny shares visible
+        out += paint("█" * n, code, on)
+        used += n
+    return out + paint("░" * (width - used), "\033[2m", on)
+
+
+# Wrap text in a colour code when colour is on, else return it unchanged.
+def paint(text: str, code: str, on: bool) -> str:
+    return f"{code}{text}{RESET}" if on else text
+
+
+# Group findings into one row per category for the summary table.
+# Each row carries its items, reclaimable size, fixable count and a hotkey for the menu.
+def category_rows(findings: list[Finding]) -> list[dict]:
+    rows: dict[str, dict] = {}
+    for f in findings:
+        k = cat_of(f)
+        r = rows.setdefault(k, {"key": k, "items": [], "size": 0, "fixable": 0, "sensitive": False})
+        r["items"].append(f)
+        # Only fixable items add to the size, so the number matches what a clean can really
+        # free.
+        r["size"] += f.size if f.fix else 0
+        r["fixable"] += 1 if f.fix else 0
+        r["sensitive"] |= f.sensitive
+    # Row order: module first, then safe before review before caution, then biggest size first.
+    order = {"safe": 0, "review": 1, "caution": 2, "info": 3}
+    mod_order = {m: i for i, m in enumerate(MODULES)}
+    def sort_key(r):
+        mod = r["items"][0].module
+        return (mod_order[mod], order[CATEGORIES[r["key"]][1]], -r["size"])
+    out = sorted(rows.values(), key=sort_key)
+    # The 'notes' row gets no hotkey. The other rows get one in display order.
+    visible = [r for r in out if r["key"] != "notes"]
+    for r in out:
+        r["hot"] = ""
+        r["module"] = r["items"][0].module
+    for i, r in enumerate(visible):
+        r["hot"] = HOTKEYS[i] if i < len(HOTKEYS) else ""
+    return out
+
+
+# ------------------------------------------------------------ tables and report
+# Matches colour escape codes so they can be ignored when measuring text width.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+# Display width of one character: 0 for combining marks, 2 for wide (CJK, emoji), else 1.
+def cw(ch: str) -> int:
+    if unicodedata.combining(ch) or ch in "️‍":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+# Visible width of a string, ignoring colour codes.
+def vlen(s: str) -> int:
+    return sum(cw(c) for c in ANSI_RE.sub("", s))
+
+
+# Cut text to width w and add an ellipsis; left=True keeps the end (useful for long paths).
+def clip(text: str, w: int, left: bool = False) -> str:
+    if vlen(text) <= w:
+        return text
+    out = ""
+    for ch in (reversed(text) if left else text):
+        if vlen(out) + cw(ch) > w - 1:
+            break
+        out = ch + out if left else out + ch
+    return ("…" + out) if left else (out + "…")
+
+
+# Usable terminal width, never less than 70.
+def term_width() -> int:
+    return max(70, shutil.get_terminal_size((110, 20)).columns - 2)
+
+
+def table(headers: list[str], rows: list[list], aligns: str, color: bool, flex: list[int] | None = None,
+          clip_left: set[int] | None = None, title: str = "", head_code: str = "\033[1m", indent: str = "  ") -> None:
+    """Rounded box table. A cell is text or (text, ansi-code). Columns in `flex` shrink to fit the terminal."""
+    flex, clip_left = flex or [], clip_left or set()
+    norm = [[c if isinstance(c, tuple) else (str(c), "") for c in row] for row in rows]
+    n = len(headers)
+    # Column width = longest cell. Then shrink the flexible columns until the table fits.
+    widths = [max([vlen(headers[i])] + [vlen(r[i][0]) for r in norm]) for i in range(n)]
+    over = sum(widths) + 3 * n + 1 + len(indent) - term_width()
+    for i in flex:
+        if over <= 0:
+            break
+        cut = min(over, max(0, widths[i] - 14))
+        widths[i] -= cut
+        over -= cut
+
+    # Clip, pad and align one cell (l = left, r = right, anything else = centred).
+    def cell(text: str, code: str, i: int, align: str) -> str:
+        text = clip(text, widths[i], i in clip_left) if not ANSI_RE.search(text) else text
+        pad = " " * (widths[i] - vlen(text))
+        body = paint(text, code, color) if code else text
+        return (pad + body) if align == "r" else (body + pad) if align == "l" else (" " * (pad.__len__() // 2) + body + " " * (pad.__len__() - pad.__len__() // 2))
+
+    def rule(l: str, m: str, r: str) -> str:
+        return indent + l + m.join("─" * (w + 2) for w in widths) + r
+
+    if title:
+        print(f"{indent}{title}")
+    print(paint(rule("╭", "┬", "╮"), "\033[2m", color))
+    bar_ = paint("│", "\033[2m", color)
+    print(indent + bar_ + bar_.join(" " + cell(h, head_code, i, "c" if aligns[i] == "c" else aligns[i]) + " " for i, h in enumerate(headers)) + bar_)
+    print(paint(rule("├", "┼", "┤"), "\033[2m", color))
+    for row in norm:
+        print(indent + bar_ + bar_.join(" " + cell(t, c, i, aligns[i]) + " " for i, (t, c) in enumerate(row)) + bar_)
+    print(paint(rule("╰", "┴", "╯"), "\033[2m", color))
+
+
+def show(findings: list[Finding], stats: dict, rows: list[dict] | None = None) -> list[dict]:
+    """High-level report as tables: resources, savings, then one table per module."""
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    rows = rows if rows is not None else category_rows(findings)
+    du_ = shutil.disk_usage("/")
+    mi = meminfo()
+    # Reclaimable storage bytes grouped by safety level.
+    by_safety = {"safe": 0, "review": 0, "caution": 0}
+    for r in rows:
+        if r["module"] == "storage":
+            by_safety[CATEGORIES[r["key"]][1]] = by_safety.get(CATEGORIES[r["key"]][1], 0) + r["size"]
+    total = sum(by_safety.values())
+    G, Y, R, D = SAFETY_COLOR["safe"], SAFETY_COLOR["review"], SAFETY_COLOR["caution"], SAFETY_COLOR["info"]
+    BOLD = "\033[1m"
+
+    def level(p: float) -> str:
+        return G if p < 0.70 else Y if p < 0.88 else R
+
+    def res(label: str, p: float, used: str, free: str, tot: str) -> list:
+        return [(label, BOLD), bar([(p, level(p))], 24, color), (f"{p:.0%}", level(p)), used, free, tot]
+
+    print()
+    rrows = [res("💾 Disk", du_.used / du_.total, human(du_.used), human(du_.free), human(du_.total))]
+    # 'After cleanup' counts safe and review items. Caution items are left out.
+    freeable = by_safety["safe"] + by_safety["review"]
+    if freeable:
+        p2 = max(0, du_.used - freeable) / du_.total
+        rrows.append(res("✨ After cleanup", p2, human(max(0, du_.used - freeable)), human(du_.free + freeable), human(du_.total)))
+    ru = mi["MemTotal"] - mi["MemAvailable"]
+    rrows.append(res("🧠 RAM", ru / mi["MemTotal"], human(ru), human(mi["MemAvailable"]) + " available", human(mi["MemTotal"])))
+    st, sf = mi.get("SwapTotal", 0), mi.get("SwapFree", 0)
+    if st:
+        rrows.append(res("🔁 Swap", (st - sf) / st, human(st - sf), human(sf), human(st)))
+    table(["Resource", "Usage", "%", "Used", "Free", "Total"], rrows, "lllrrr", color, title=paint("📊 RESOURCES", BOLD, color))
+
+    if total:
+        print()
+        meaning = {"safe": "grows back by itself", "review": "your call; undo with `cleanup --recover`", "caution": "cannot be undone"}
+        srows = []
+        for k, label in (("safe", "🟢 Safe"), ("review", "🟡 Review"), ("caution", "🔴 Cannot undo")):
+            srows.append([(label, SAFETY_COLOR[k]), (human(by_safety[k]), SAFETY_COLOR[k]),
+                          bar([(by_safety[k] / total, SAFETY_COLOR[k])], 20, color), meaning[k]])
+        srows.append([("💰 Total", BOLD), (human(total), BOLD), bar([(by_safety["safe"] / total, G), (by_safety["review"] / total, Y), (by_safety["caution"] / total, R)], 20, color),
+                      "cleaning archives first; `cleanup --purge` releases the space"])
+        table(["Savings", "Reclaimable", "Share", "What it means"], srows, "lrll", color, flex=[3], title=paint("💰 WHAT YOU CAN SAVE", BOLD, color))
+
+    notes = []
+    skipped = [f for f in findings if f.kind in ("cache-recent", "cache-in-use")]
+    if skipped:
+        notes.append(["⏳ Left alone", f"{len(skipped)} folders, {human(sum(f.size for f in skipped))} are in use or changed in the last 3 days (see -c notes)"])
+    held = sum(e.get("bytes", 0) for b in list_batches() for e in load_manifest(b))
+    if held:
+        notes.append([("📥 Archived", Y), (f"{human(held)} archived, not yet freed: [p] or `cleanup --purge` (undo: `cleanup --recover`)", Y)])
+    if stats.get("folders"):
+        notes.append(["📝 Claude memory", f"{stats['memories']} notes in {stats['folders']} folders"])
+    if notes:
+        print()
+        table(["Note", "Detail"], notes, "ll", color, flex=[1], title=paint("ℹ NOTES", BOLD, color))
+
+    # The biggest category sets the full bar, so the small bars are comparable.
+    biggest = max([r["size"] for r in rows if r["module"] != "claude"] + [1])
+    for mod in MODULES:
+        # Hide the 'notes' row and tidy-only rows with nothing to fix, unless something was just
+        # cleaned.
+        mrows = [r for r in rows if r["module"] == mod and not ((r["key"] == "notes" or (r["key"] == "mem-tidy" and not r["fixable"])) and not r.get("cleaned"))]
+        if not mrows:
+            continue
+        out = []
+        for r in mrows:
+            title, safety, blurb = CATEGORIES[r["key"]]
+            sc = SAFETY_COLOR[safety]
+            hot = r["hot"] or ""
+            if r.get("cleaned") and not r["items"]:
+                out.append([(hot, BOLD), (title, G), ("0", G), ("0 B", G), bar([(0, G)], 10, color), ("✅ Done", G),
+                            (f"{human(r['cleaned'])} cleaned" if r["cleaned"] > 1 else "cleaned", G)])
+                continue
+            size = human(r["size"]) if r["size"] else "-"
+            mini = bar([(r["size"] / biggest, sc)], 10, color) if r["size"] and mod != "claude" else " " * 10
+            note = blurb + ("  🔑 may hold secrets" if r["sensitive"] else "") + (f"  (+{human(r['cleaned'])} cleaned)" if r.get("cleaned") else "")
+            out.append([(hot, BOLD), (title, sc), str(len(r["items"])), (size, sc if r["size"] else D), mini, (SAFETY_LABEL[safety], sc),
+                        (note, "\033[1;31m" if r["sensitive"] else "")])
+        print()
+        table(["Key", "Category", "Items", "Size", "Share", "Safety", "Note"], out, "lllrlll" if False else "llrrlll", color, flex=[6, 1],
+              title=f"{MODULE_ICON[mod]} {paint(MODULE_TITLE[mod], MODULE_COLOR[mod], color)}")
+    return rows
+
+
+# Print one table per category listing its items (top `limit` by size; None = all).
+def show_details(rows: list[dict], keys: list[str] | None, limit: int | None = 15) -> None:
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    for r in rows:
+        if keys and r["key"] not in keys:
+            continue
+        title, safety, blurb = CATEGORIES[r["key"]]
+        sc = SAFETY_COLOR[safety]
+        items = sorted(r["items"], key=lambda f: (-f.size, f.where))
+        shown = items if limit is None else items[:limit]
+        out = []
+        for f in shown:
+            flags = [x for x in (SHORT_RECOVER.get(recover_kind(f), ""), "needs sudo" if f.risk == "sudo" else "", "🔑 may hold secrets" if f.sensitive else "") if x]
+            out.append([(human(f.size) if f.size else "-", sc), f.where, f.message.split(": ", 1)[-1] if f.size else f.message, "; ".join(flags)])
+        print()
+        table(["Size", "Item", "What it is", "Undo / flags"], out, "rlll", color, flex=[2, 1], clip_left={1},
+              title=f"{paint(title, chr(27) + '[1m', color)}  {paint(SAFETY_LABEL[safety], sc, color)}  ({blurb})")
+        if limit is not None and len(items) > limit:
+            print(f"  ... and {len(items) - limit} more (cleanup --scan -c {r['key']} --all)")
+
+
+# Short note for the plan list saying what a change does to the user (quit app, sudo, undo).
+def plan_tag(f: Finding) -> str:
+    rk = recover_kind(f)
+    tags = []
+    if f.risk == "terminate":
+        tags.append("⚠ quits the running app")
+    if f.risk == "sudo":
+        tags.append("needs sudo")
+    if rk == "irreversible":
+        tags.append("⚠ CANNOT be undone")
+    return ", ".join(tags) or (RECOVER_TEXT.get(rk, rk) or "reversible")
+
+
+def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]:
+    """List every touch point first, then one choice: yes to all, one by one, or cancel."""
+    items = []
+    for f in findings:
+        if not f.fix:
+            continue
+        target = f.fix.get("path") or f.fix.get("index") or f.fix.get("dst") or f.fix.get("dir")
+        if target and not Path(target).exists():
+            continue
+        items.append(f)
+    if not items:
+        print("Nothing fixable automatically.")
+        return []
+    if not sys.stdin.isatty() and not (assume_yes or dry):
+        print("--clean needs a terminal to ask questions (or pass -y / --dry-run).", file=sys.stderr)
+        return []
+    # index lines bottom-up; harmless items first, sudo next, app-quitting items always last
+    # Sort key: risk rank first (0 plain, 1 sudo, 2 quits an app), then higher index line
+    # numbers
+    # first (deleting from the bottom keeps the other line numbers valid), then bigger size.
+    items.sort(key=lambda f: ({"terminate": 2, "sudo": 1}.get(f.risk, 0), -f.fix.get("line", 0), -f.size))
+    print(f"\nPlanned changes ({len(items)}):")
+    for i, f in enumerate(items, 1):
+        sz = f"  {human(f.size)}" if f.size else ""
+        print(f"  {i:>3}. [{MODULE_TITLE[f.module]}] {f.kind}: {f.where}{sz}  ({plan_tag(f)})")
+    batch = Batch(time.strftime("%Y%m%d-%H%M%S"))
+    if dry:
+        for f in items:
+            print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  {apply_fix(f, batch, dry=True)}")
+        return []
+    n_irr = sum(1 for f in items if recover_kind(f) == "irreversible")
+    n_term = sum(1 for f in items if f.risk == "terminate")
+    # y = apply everything in the list, o = ask for each item. Anything else cancels.
+    mode = "y" if assume_yes else key("\n  [y] yes to all / [o] one by one / [N] cancel: ", "n")
+    if mode not in ("y", "o"):
+        print("  cancelled, nothing changed.")
+        return []
+    allow_irr = False
+    if mode == "y" and n_irr and not assume_yes:
+        allow_irr = input(f"  {n_irr} of these CANNOT be undone (marked ⚠). Type 'yes' to include them, anything else skips them: ").strip() == "yes"
+    done, freed_now = 0, 0
+    applied: list[Finding] = []
+    for f in items:
+        rk = recover_kind(f)
+        permanent = False
+        if mode == "y":
+            if rk == "irreversible" and not allow_irr:
+                print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  skipped (cannot be undone)")
+                continue
+            # -y never quits a running app. That always needs a person to confirm.
+            if f.risk == "terminate" and assume_yes:
+                print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  skipped (quits a running app; run without -y)")
+                continue
+            print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}")
+        else:
+            print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  {f.message}\n  -> {f.action}  ({plan_tag(f)})")
+            if rk == "irreversible":
+                if input("  this CANNOT be undone. Type 'yes' to continue: ").strip() != "yes":
+                    continue
+            else:
+                # Permanent delete is offered only for archived storage items.
+                perm_ok = f.fix["op"] == "trash" and f.module == "storage"
+                ans = key("  apply? [y]es / [N]o / [q]uit" + (" / [p]ermanent delete now" if perm_ok else "") + ": ", "n")
+                if ans == "q":
+                    break
+                if ans == "p" and perm_ok:
+                    if input("  permanent: no recovery. Type 'yes': ").strip() != "yes":
+                        continue
+                    permanent = True
+                elif ans != "y":
+                    continue
+        try:
+            print("  " + apply_fix(f, batch, permanent=permanent))
+            done += 1
+            applied.append(f)
+            if permanent:
+                freed_now += f.size
+        except Exception as e:  # keep going; one failure must not lose the manifest
+            print(f"  failed: {e}")
+        # Save the manifest after every item, so a later failure cannot lose the undo
+        # information.
+        batch.save()
+        batch.entries = []
+    print(f"\n{done} change(s) applied." + (f" Freed at once: {human(freed_now)}." if freed_now else ""))
+    if done and (batch.dir / "manifest.json").exists():
+        print(f"Archive: {short(batch.dir)}\n  undo:  cleanup --recover {batch.stamp}\n  free the held space later: cleanup --purge")
+    return applied
+
+
+def apply_done(rows: list[dict], findings: list[Finding], applied: list[Finding]) -> list[Finding]:
+    """Remove cleaned findings in place, keeping the rows (and their hotkeys) so the report stays put."""
+    gone = {id(f) for f in applied}
+    for r in rows:
+        r["cleaned"] = r.get("cleaned", 0) + sum(max(f.size, 1) for f in r["items"] if id(f) in gone)
+        r["items"] = [f for f in r["items"] if id(f) not in gone]
+        r["size"] = sum(f.size for f in r["items"] if f.fix)
+        r["fixable"] = sum(1 for f in r["items"] if f.fix)
+        r["sensitive"] = any(f.sensitive for f in r["items"])
+    return [f for f in findings if id(f) not in gone]
+
+
+def explore(args) -> None:
+    """Scan, show the summary, then drill into a category or clean; the report stays and updates."""
+    findings, stats = collect(args)
+    rows = category_rows(findings)
+    show(findings, stats, rows)
+    if not findings:
+        print("\n  Nothing to clean up.")
+        return
+    while True:
+        c = key("\n  Number/letter = details, [c] clean all fixable, [a] all details, [p] purge archive, [r] redraw, [q] back: ", "q")
+        if c in ("q", ""):
+            return
+        if c == "a":
+            show_details(rows, None, None)
+        elif c == "r":
+            show(findings, stats, rows)
+        elif c == "p":
+            purge(None, False)
+            show(findings, stats, rows)
+        elif c == "c":
+            # "clean all" never quits running apps; those are only offered from their own category (the apps list)
+            bulk = [f for f in findings if f.fix and f.risk != "terminate"]
+            n_skip = sum(1 for f in findings if f.fix and f.risk == "terminate")
+            if n_skip:
+                print(f"\n  Running apps are not part of 'clean all' ({n_skip} left out); quit them from the apps category.")
+            applied = clean(bulk, False, False)
+            findings = apply_done(rows, findings, applied)
+            show(findings, stats, rows)
+        else:
+            r = next((r for r in rows if r["hot"] == c and r["key"] != "notes"), None)
+            if not r:
+                continue
+            show_details(rows, [r["key"]], None)
+            if r["fixable"]:
+                applied = clean([f for f in findings if cat_of(f) == r["key"]], False, False)
+                findings = apply_done(rows, findings, applied)
+                show(findings, stats, rows)
+
+
+# Interactive main menu shown when run with no options on a terminal.
+def menu(args) -> int:
+    while True:
+        n = len(list_batches())
+        print("\ncleanup: storage, RAM and Claude memory\n"
+              "  1) Scan everything          overview of space, RAM and notes (changes nothing)\n"
+              "  2) Storage                  caches, build folders, Docker, system\n"
+              "  3) RAM                      pressure, swap, biggest apps\n"
+              "  4) Claude memory            index, stale and duplicate notes\n"
+              f"  5) Recover                  put back archived items ({n} batch{'es' if n != 1 else ''})\n"
+              "  6) Purge                    permanently free archived items\n"
+              "  7) Deep storage scan        also finds files over 1 GiB\n"
+              "  q) Quit                     (cleanup --help lists every option)")
+        c = key("Choose: ", "q")
+        pick = {"1": None, "2": ["storage"], "3": ["ram"], "4": ["claude"], "7": ["storage"]}
+        if c in pick:
+            args.module = pick[c]
+            args.deep = c == "7"
+            explore(args)
+        elif c == "5":
+            recover(None, False)
+        elif c == "6":
+            purge(None, False)
+        elif c in ("q", ""):
+            return 0
+
+
+# Handle one command: the list/recover/purge/json shortcuts first, else scan (and clean).
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.list_trash:
+        bs = list_batches()
+        print("Archive is empty." if not bs else "")
+        for b in bs:
+            print(batch_summary(b))
+            for e in load_manifest(b):
+                print("   ", entry_line(e))
+        return 0
+    if args.recover is not None:
+        return recover(args.recover or None, args.yes)
+    if args.purge is not None:
+        return purge(None if args.purge < 0 else args.purge, args.yes)
+    if args.json:
+        findings, _ = collect(args)
+        print(json.dumps([dict(asdict(f), category=cat_of(f)) for f in findings], indent=2))
+        return 0
+    if not (args.scan or args.clean) and sys.stdin.isatty() and sys.stdout.isatty():
+        return menu(args)
+    findings, stats = collect(args)
+    if args.category:
+        findings = [f for f in findings if cat_of(f) in args.category]
+        show_details(category_rows(findings), args.category, None if args.all else 15)
+    else:
+        rows = show(findings, stats)
+        if args.all:
+            show_details(rows, None, None)
+        elif findings and not args.clean:
+            print("\n  Details: cleanup --scan -c <category>   (names: " + ", ".join(r["key"] for r in rows if r["key"] != "notes") + ")")
+    if args.clean:
+        clean(findings, args.yes, args.dry_run)
+    elif findings:
+        print("  Next: cleanup --clean [-c category]   cleanup --recover   cleanup --purge   cleanup --help")
+    return 0
+
+
+# Wrap main() so Ctrl-C, Ctrl-D and a closed pipe end quietly instead of showing a traceback.
+def run_main() -> int:
+    try:
+        return main()
+    except (KeyboardInterrupt, EOFError):
+        print("\n\n  👋 Good bye! Nothing is left half-done: anything already cleaned is archived "
+              "(undo with `cleanup --recover`).\n")
+        return 130
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_main())
