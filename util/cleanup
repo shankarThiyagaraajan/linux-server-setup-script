@@ -5,6 +5,13 @@ Run with no arguments for a menu. Run `cleanup --help` for every option.
 Nothing is changed by a scan. Clean always keeps a way back under ~/.cleanup-trash/.
 """
 
+# How this file is organised (top to bottom):
+# 1. Constants and the two data classes (Memory = one note, Finding = one result).
+# 2. Claude memory checks: parse notes, find their project, scan each memory folder.
+# 3. Shared helpers, then the storage, Docker and RAM scanners.
+# 4. Archive and fix: move things to ~/.cleanup-trash, apply fixes, recover, purge.
+# 5. Command line, categories, tables and report, the clean flow, menu and main().
+
 from __future__ import annotations
 
 import argparse
@@ -21,21 +28,27 @@ import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# Home folder, and the archive folder where cleaned items are kept so they can be undone.
 HOME = Path.home()
 TRASH = HOME / ".cleanup-trash"
 INDEX = "MEMORY.md"
+# Limits and valid note types used when judging Claude memory notes.
 INDEX_MAX_LINES = 200  # Claude Code truncates MEMORY.md after about this many lines
 VALID_TYPES = {"user", "feedback", "project", "reference"}
+# Patterns for [[links]] between notes, index lines '- [title](file)', and `~/paths` in notes.
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 INDEX_LINE_RE = re.compile(r"^\s*-\s*\[([^\]]*)\]\(([^)]+)\)")
 PATH_RE = re.compile(r"`((?:~|/home/)[^`\s]+)`")
+# Words that hint a project note is time-bound and may be out of date.
 STALE_WORDS = re.compile(r"\b(resume point|stopped|until|for now|temporar|tonight|tomorrow|this week|blocked on)\b", re.I)
 
+# Severity ranking (lower number = more important) and terminal colour codes for each level.
 SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 COLORS = {"high": "\033[31m", "medium": "\033[33m", "low": "\033[36m", "info": "\033[2m"}
 RESET = "\033[0m"
 
 
+# One Claude memory note (a .md file): its frontmatter fields, body text and last-change time.
 @dataclass
 class Memory:
     path: Path
@@ -47,6 +60,8 @@ class Memory:
     mtime: float = 0.0
 
 
+# One result of a scan: what is wrong or what can be freed, plus an optional machine fix.
+# A finding with an empty `fix` is report-only; `clean` can only act on findings that have one.
 @dataclass
 class Finding:
     severity: str
@@ -65,6 +80,8 @@ class Finding:
 # ---------------------------------------------------------------- parsing
 
 
+# Read one note file and split off its '---' frontmatter block (name, description, type).
+# Notes without frontmatter still load; they just have empty fields and has_frontmatter=False.
 def parse_memory(path: Path) -> Memory:
     text = path.read_text(errors="replace")
     mem = Memory(path=path, mtime=path.stat().st_mtime)
@@ -106,9 +123,12 @@ def resolve_project_path(encoded: str) -> Path | None:
     """
     target = encoded.lstrip("-")
 
+    # Same encoding Claude Code uses for folder names: anything not a letter or digit becomes
+    # '-'.
     def enc(s: str) -> str:
         return re.sub(r"[^A-Za-z0-9]", "-", s)
 
+    # Depth-first search: match the encoded name piece by piece against real child folders.
     def walk(base: Path, rest: str) -> Path | None:
         if not rest:
             return base
@@ -130,6 +150,8 @@ def resolve_project_path(encoded: str) -> Path | None:
     return walk(Path("/"), target)
 
 
+# Ask the newest session logs for the real working folder (more exact than guessing from the
+# name).
 def session_cwd(project_dir: Path) -> str | None:
     for f in sorted(project_dir.glob("*.jsonl"), key=lambda p: -p.stat().st_mtime)[:3]:
         try:
@@ -143,6 +165,7 @@ def session_cwd(project_dir: Path) -> str | None:
     return None
 
 
+# Encode a folder path the way Claude Code names its project folders.
 def project_for_cwd(cwd: Path) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
 
@@ -150,15 +173,19 @@ def project_for_cwd(cwd: Path) -> str:
 # ---------------------------------------------------------------- checks
 
 
+# Text likeness from 0 to 1, ignoring case. Used to spot near-duplicate notes.
 def similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+# Shorten a path for display by writing the home folder as '~'.
 def short(p: Path) -> str:
     s = str(p)
     return "~" + s[len(str(HOME)) :] if s.startswith(str(HOME)) else s
 
 
+# Check one project's memory folder and return its findings plus its parsed notes.
+# Checks run in order: project gone, index health, per-note problems, duplicates, [[links]].
 def scan_memory_dir(mdir: Path, stale_days: int) -> tuple[list[Finding], dict[str, Memory]]:
     findings: list[Finding] = []
     where = short(mdir)
@@ -315,6 +342,7 @@ def scan_cross_home(groups: dict[str, dict[str, dict[str, Memory]]]) -> list[Fin
     return out
 
 
+# Find the Claude config homes to scan: the ones given with --home, else every ~/.claude*.
 def find_homes(explicit: list[str] | None) -> list[Path]:
     if explicit:
         return [Path(os.path.expanduser(h)) for h in explicit]
@@ -345,6 +373,7 @@ def key(prompt: str, default: str = "") -> str:
 # ------------------------------------------------------------ shared helpers
 
 
+# Format a byte count for people, e.g. 1536 -> '1.5 KiB'.
 def human(n: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if abs(n) < 1024 or unit == "TiB":
@@ -353,6 +382,7 @@ def human(n: float) -> str:
     return str(n)
 
 
+# Run a command and return the result, or None if it is missing or times out. Never raises.
 def run(argv: list[str], timeout: int = 60, sudo: bool = False) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run((["sudo"] if sudo else []) + argv, capture_output=True, text=True, timeout=timeout)
@@ -360,6 +390,7 @@ def run(argv: list[str], timeout: int = 60, sudo: bool = False) -> subprocess.Co
         return None
 
 
+# Disk space used by a folder in bytes (stays on one filesystem). Returns 0 if du fails.
 def du(path: Path, timeout: int = 120) -> int:
     r = run(["du", "-sb", "--one-file-system", str(path)], timeout)
     try:
@@ -368,10 +399,13 @@ def du(path: Path, timeout: int = 120) -> int:
         return 0
 
 
+# Print a progress message to stderr so it does not mix with --json output on stdout.
 def note(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# Build the standard storage Finding: its fix is 'move to the archive', which can be undone.
+# `regen` says how it comes back (regenerates / quarantine / ...).
 def storage_finding(sev: str, kind: str, path: Path, size: int, msg: str, regen: str, **kw) -> Finding:
     return Finding(sev, kind, short(path), f"{human(size)}: {msg}", "move it to the cleanup archive (undoable); purge later to free the space",
                    {"op": "trash", "path": str(path)}, module="storage", size=size, recover=regen, **kw)
@@ -396,6 +430,7 @@ KNOWN_CACHES = {
     "google-chrome": ("Chrome browser cache", "chrome"),
     "huggingface": ("downloaded models; re-download can be slow", ""),
 }
+# Tool caches outside ~/.cache: (folder, label).
 TOOL_CACHES = [
     (Path("~/.npm/_cacache"), "npm cache"),
     (Path("~/.cargo/registry/cache"), "cargo downloaded crates"),
@@ -404,15 +439,20 @@ TOOL_CACHES = [
     (Path("~/.bun/install/cache"), "bun install cache"),
     (Path("~/.pub-cache/hosted"), "Dart/Flutter pub packages"),
 ]
+# Ignore caches below 200 MiB and build folders below 100 MiB; not worth listing.
 CACHE_MIN = 200 * 1024**2
 ARTIFACT_MIN = 100 * 1024**2
 
 
+# True if a process with exactly this name is running (used to skip a browser's cache while
+# open).
 def proc_running(name: str) -> bool:
     r = run(["pgrep", "-x", name], 5)
     return bool(r and r.returncode == 0)
 
 
+# Look for reclaimable disk space: caches, old build folders, old /tmp files, then the
+# system and Docker scanners. Only reports; nothing is changed here.
 def scan_storage(deep: bool, artifact_days: int) -> list[Finding]:
     out: list[Finding] = []
     note("storage: caches...")
@@ -457,6 +497,9 @@ def scan_storage(deep: bool, artifact_days: int) -> list[Finding]:
     lab = HOME / "LAB"
     cutoff = time.time() - artifact_days * 86400
     if lab.is_dir():
+        # Walk ~/LAB looking for Rust target/ and node_modules folders. Skip git and venv
+        # folders.
+        # A folder only counts if its project file sits beside it (Cargo.toml / package.json).
         for root, dirs, _files in os.walk(lab):
             depth = len(Path(root).relative_to(lab).parts)
             keep = []
@@ -476,6 +519,7 @@ def scan_storage(deep: bool, artifact_days: int) -> list[Finding]:
                     except OSError:
                         pass
                     continue  # do not descend
+                # Do not go deeper than 6 levels, to keep the scan quick.
                 if depth < 6:
                     keep.append(d)
             dirs[:] = keep
@@ -506,6 +550,8 @@ def scan_storage(deep: bool, artifact_days: int) -> list[Finding]:
     return out
 
 
+# Find system-level space users (apt cache, journal, old snaps, flatpak). All need sudo or a
+# command.
 def scan_system() -> list[Finding]:
     out: list[Finding] = []
     note("storage: system (apt, journal, snap)...")
@@ -564,6 +610,9 @@ def protected_refs() -> tuple[set[str], set[str]]:
     return hexes, refs
 
 
+# Find old Docker images that are safe to remove, plus reclaimable build cache.
+# An image is skipped if any container uses it or a TBO release pins it. Volumes are never
+# touched.
 def scan_docker() -> list[Finding]:
     out: list[Finding] = []
     if not shutil.which("docker"):
@@ -621,12 +670,15 @@ def scan_docker() -> list[Finding]:
 
 # ------------------------------------------------------------------ RAM
 
+# Process names we never offer to quit (system, shells, databases, dev tools).
+# Matched against the whole name with this pattern.
 PROTECTED_PROC = re.compile(
     r"^(systemd|init|Xorg|Xwayland|gnome-.*|gdm.*|dbus.*|pipewire.*|pulseaudio|wireplumber|sshd|tmux.*|screen|dockerd|containerd.*|docker.*|"
     r"postgres.*|redis.*|temporal.*|keycloak.*|caddy|java|NetworkManager|snapd|cron|bash|zsh|fish|sh|login|sudo|"
     r"tbo.*|claude|codex|node|python.*|ibus.*|polkit.*|udisks.*|cleanup)$")
 
 
+# Read /proc/meminfo into a dict of name -> bytes.
 def meminfo() -> dict[str, int]:
     out = {}
     for ln in Path("/proc/meminfo").read_text().splitlines():
@@ -635,6 +687,7 @@ def meminfo() -> dict[str, int]:
     return out
 
 
+# PIDs of this program and its parents, so we never offer to quit the terminal we run in.
 def ancestors() -> set[int]:
     pids, pid = set(), os.getpid()
     while pid > 1:
@@ -646,6 +699,9 @@ def ancestors() -> set[int]:
     return pids
 
 
+# Report memory pressure, then list the biggest app groups (by name) that could be asked to
+# quit.
+# Protected, system and our own processes are shown as info only and never get a fix.
 def scan_ram() -> list[Finding]:
     out: list[Finding] = []
     mi = meminfo()
@@ -703,6 +759,8 @@ def scan_ram() -> list[Finding]:
 
 # ------------------------------------------------------- archive and fix
 
+# How each recovery kind is explained to the user, and its short tag in tables.
+# DEFAULT_RECOVER covers fix ops that always go through the archive.
 RECOVER_TEXT = {
     "quarantine": "undo: cleanup --recover",
     "regenerates": "comes back by itself",
@@ -716,21 +774,28 @@ DEFAULT_RECOVER = {"trash": "quarantine", "drop-index-line": "quarantine", "copy
                    "add-index-line": "quarantine", "rebuild-index": "quarantine", "rmdir": "quarantine"}
 
 
+# How a finding can be undone: its own setting, else a default for its operation, else none.
 def recover_kind(f: Finding) -> str:
     return f.recover or DEFAULT_RECOVER.get(f.fix.get("op", ""), "")
 
 
+# One clean run's archive folder: ~/.cleanup-trash/<timestamp>/ plus a manifest.json
+# listing every change, so --recover knows how to put each item back.
 class Batch:
     def __init__(self, stamp: str):
         self.stamp = stamp
         self.dir = TRASH / stamp
         self.entries: list[dict] = []
 
+    # Where an original file is stored inside the batch (the same path, kept under the batch
+    # folder).
     def store_path(self, original: Path, suffix: str = "") -> Path:
         dest = self.dir / (str(original).lstrip("/") + suffix)
         dest.parent.mkdir(parents=True, exist_ok=True)
         return dest
 
+    # Append this run's entries to manifest.json. Called after each item so a crash loses
+    # nothing.
     def save(self) -> None:
         if self.entries:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -739,6 +804,9 @@ class Batch:
             mf.write_text(json.dumps(old + self.entries, indent=1))
 
 
+# Move a file or folder into the batch instead of deleting it. That is why a clean can be
+# undone.
+# Space is only freed later by purge.
 def trash(path: Path, batch: Batch, module: str) -> Path:
     size = du(path) if path.is_dir() else path.stat().st_size
     dest = batch.store_path(path)
@@ -747,6 +815,7 @@ def trash(path: Path, batch: Batch, module: str) -> Path:
     return dest
 
 
+# Copy a file into the batch (as .bak) before we edit it, so the old version can be restored.
 def backup(path: Path, batch: Batch) -> Path:
     dest = batch.store_path(path, ".bak")
     shutil.copy2(path, dest)
@@ -754,6 +823,8 @@ def backup(path: Path, batch: Batch) -> Path:
     return dest
 
 
+# Carry out one finding's fix and return a one-line result for the user.
+# `fx["op"]` picks the action. dry=True only describes it. permanent=True skips the archive.
 def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = False) -> str:
     fx = f.fix
     op = fx["op"]
@@ -779,6 +850,8 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
         return "archived"
     if op == "drop-index-line":
         p = Path(fx["index"])
+        # A dangling index line points to a note file that no longer exists. Back up the index
+        # first.
         backup(p, batch)
         lines = p.read_text().splitlines(keepends=True)
         del lines[fx["line"] - 1]
@@ -806,6 +879,7 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
         shutil.copy2(fx["src"], dst)
         return "copied (old version archived)"
     if op == "cmd":
+        # sudo asks for a password, so it cannot run without a terminal.
         if fx.get("sudo") and not sys.stdin.isatty():
             return "skipped: needs sudo and a terminal"
         r = subprocess.run((["sudo"] if fx.get("sudo") else []) + fx["argv"], capture_output=True, text=True)
@@ -814,6 +888,7 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
         tail = (r.stdout.strip().splitlines() or r.stderr.strip().splitlines() or [""])[-1]
         return ("done" if r.returncode == 0 else f"failed (exit {r.returncode})") + (f": {tail}" if tail else ".")
     if op == "docker-rmi":
+        # Save the image to a tar file first. Only remove it if the save worked.
         tar = batch.store_path(Path("/docker") / (fx["id"].replace("sha256:", "")[:12] + ".tar"))
         s = subprocess.run(["docker", "save", "-o", str(tar), *(fx.get("tags") or [fx["id"]])], capture_output=True, text=True)
         if s.returncode != 0:
@@ -826,6 +901,8 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
         return f"saved to {short(tar)} and removed (docker load restores it)"
     if op == "terminate":
         saved, gone = [], 0
+        # Step 1: remember each process's command line, folder and program so --recover can
+        # relaunch it.
         for pid in fx["pids"]:
             try:
                 cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
@@ -834,11 +911,13 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
                 saved.append({"pid": pid, "argv": [c.decode(errors="replace") for c in cmdline], "cwd": cwd, "exe": exe})
             except OSError:
                 pass
+        # Step 2: politely ask every process to quit (SIGTERM). We never force-kill.
         for pid in fx["pids"]:
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
+        # Step 3: wait a moment, then count the ones that exited (a zombie counts as gone).
         time.sleep(3)
         for pid in fx["pids"]:
             try:
@@ -858,10 +937,12 @@ def apply_fix(f: Finding, batch: Batch, permanent: bool = False, dry: bool = Fal
 # ------------------------------------------------------------------- recover
 
 
+# Archive batches, newest first (a batch counts only if it has a manifest).
 def list_batches() -> list[Path]:
     return sorted((p for p in TRASH.glob("*") if p.is_dir() and (p / "manifest.json").exists()), reverse=True) if TRASH.exists() else []
 
 
+# Read a batch's manifest.json; an unreadable or missing one counts as empty.
 def load_manifest(b: Path) -> list[dict]:
     try:
         return json.loads((b / "manifest.json").read_text())
@@ -869,6 +950,7 @@ def load_manifest(b: Path) -> list[dict]:
         return []
 
 
+# One-line summary of a batch: name, entry counts by type, and bytes held.
 def batch_summary(b: Path) -> str:
     es = load_manifest(b)
     kinds: dict[str, int] = {}
@@ -878,6 +960,7 @@ def batch_summary(b: Path) -> str:
     return f"{b.name}  {len(es)} entries ({', '.join(f'{n} {k}' for k, n in kinds.items())}), {human(size)} held"
 
 
+# One-line description of a manifest entry, used when listing and when asking to restore.
 def entry_line(e: dict) -> str:
     t = e["type"]
     if t == "file":
@@ -894,6 +977,9 @@ def entry_line(e: dict) -> str:
     return t
 
 
+# Restore archived items. Pick a batch by prefix, by -y (newest), or from a prompt.
+# Commands that already ran are only listed; they cannot be reversed. Files that are
+# back in place are removed from the manifest; a fully restored batch folder is deleted.
 def recover(batch_arg: str | None, assume_yes: bool) -> int:
     batches = list_batches()
     if not batches:
@@ -978,6 +1064,8 @@ def recover(batch_arg: str | None, assume_yes: bool) -> int:
     return 0
 
 
+# Permanently delete archived batches (all, or older than N days). This is the only step that
+# frees archived space, and it ends --recover for them, so it asks for 'yes' first.
 def purge(days: int | None, assume_yes: bool) -> int:
     batches = list_batches()
     cut = time.time() - (days or 0) * 86400
@@ -1003,9 +1091,11 @@ def purge(days: int | None, assume_yes: bool) -> int:
 
 # ------------------------------------------------------------------ main
 
+# The three scan modules, in report order, and their headings.
 MODULES = ["storage", "ram", "claude"]
 MODULE_TITLE = {"storage": "STORAGE", "ram": "RAM", "claude": "CLAUDE MEMORY"}
 
+# Long help text shown below the option list in --help.
 EPILOG = """\
 Modules (-m, repeatable; default all):
   storage   caches, old build folders (target/, node_modules), /tmp, Docker images and build cache,
@@ -1033,6 +1123,7 @@ Examples:
   cleanup --scan -m claude --here only this folder's Claude project memory"""
 
 
+# Define every command line option. Help text and examples live in EPILOG above.
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="cleanup", description="Scan, clean and recover disk space, RAM and Claude memory.",
                                  epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1061,6 +1152,8 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+# Run the chosen modules and return (findings, stats), already filtered by --min severity
+# and sorted: module, then severity, then biggest size first.
 def collect(args) -> tuple[list[Finding], dict]:
     mods = args.module or MODULES
     findings: list[Finding] = []
@@ -1108,6 +1201,7 @@ CATEGORIES = {
     "mem-tidy": ("Claude notes: style and FYI", "info", "optional"),
     "notes": ("Notes and protected items", "info", "nothing to do"),
 }
+# Which report category each finding kind falls under (see CATEGORIES above).
 KIND_CATEGORY = {
     "cache": "caches", "tool-cache": "caches", "cache-unknown": "scratch", "build-artifacts": "build", "tmp-old": "tmp",
     "docker-image": "docker", "docker-build-cache": "dockercache", "apt-cache": "system", "snap-old": "system",
@@ -1119,14 +1213,19 @@ KIND_CATEGORY = {
     "stale": "mem-stale", "time-bound": "mem-stale", "near-duplicate": "mem-stale", "thin": "mem-stale",
     "cross-home-drift": "mem-stale",
 }
+# Display labels, icons and colours for the report.
 SAFETY_LABEL = {"safe": "🟢 SAFE", "review": "🟡 REVIEW", "caution": "🔴 CAUTION", "info": "⚪ INFO"}
 MODULE_ICON = {"storage": "📦", "ram": "🧠", "claude": "📝"}
 MODULE_COLOR = {"storage": "\033[1;36m", "ram": "\033[1;35m", "claude": "\033[1;34m"}
 SAFETY_COLOR = {"safe": "\033[32m", "review": "\033[33m", "caution": "\033[31m", "info": "\033[2m"}
+# Keys given to categories in order, so a category can be opened with one key press.
 HOTKEYS = "123456789bdefghijklmnoprstuvwxyz"
+# File names that look like secrets (.env, keys, tokens). Used only to warn, never to read
+# content.
 SECRET_NAMES = re.compile(r"(^\.env($|\.)|id_(rsa|ed25519|ecdsa)|\.pem$|\.p12$|\.pfx$|\.key$|credentials|\.git-credentials|\.netrc|token|secret|\.kdbx$)", re.I)
 
 
+# Which report category a finding belongs to; unknown kinds fall back by module.
 def cat_of(f: Finding) -> str:
     return KIND_CATEGORY.get(f.kind, "mem-tidy" if f.module == "claude" else "notes")
 
@@ -1149,6 +1248,7 @@ def has_secrets(path: Path, cap: int = 4000) -> bool:
     return False
 
 
+# Flag cleanup candidates whose folder contains secret-looking file names (warning only).
 def mark_sensitive(findings: list[Finding]) -> None:
     for f in findings:
         if f.kind in ("cache-unknown", "tmp-old") and f.fix.get("path"):
@@ -1167,25 +1267,32 @@ def bar(parts: list[tuple[float, str]], width: int, on: bool) -> str:
     return out + paint("░" * (width - used), "\033[2m", on)
 
 
+# Wrap text in a colour code when colour is on, else return it unchanged.
 def paint(text: str, code: str, on: bool) -> str:
     return f"{code}{text}{RESET}" if on else text
 
 
+# Group findings into one row per category for the summary table.
+# Each row carries its items, reclaimable size, fixable count and a hotkey for the menu.
 def category_rows(findings: list[Finding]) -> list[dict]:
     rows: dict[str, dict] = {}
     for f in findings:
         k = cat_of(f)
         r = rows.setdefault(k, {"key": k, "items": [], "size": 0, "fixable": 0, "sensitive": False})
         r["items"].append(f)
+        # Only fixable items add to the size, so the number matches what a clean can really
+        # free.
         r["size"] += f.size if f.fix else 0
         r["fixable"] += 1 if f.fix else 0
         r["sensitive"] |= f.sensitive
+    # Row order: module first, then safe before review before caution, then biggest size first.
     order = {"safe": 0, "review": 1, "caution": 2, "info": 3}
     mod_order = {m: i for i, m in enumerate(MODULES)}
     def sort_key(r):
         mod = r["items"][0].module
         return (mod_order[mod], order[CATEGORIES[r["key"]][1]], -r["size"])
     out = sorted(rows.values(), key=sort_key)
+    # The 'notes' row gets no hotkey. The other rows get one in display order.
     visible = [r for r in out if r["key"] != "notes"]
     for r in out:
         r["hot"] = ""
@@ -1196,19 +1303,23 @@ def category_rows(findings: list[Finding]) -> list[dict]:
 
 
 # ------------------------------------------------------------ tables and report
+# Matches colour escape codes so they can be ignored when measuring text width.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+# Display width of one character: 0 for combining marks, 2 for wide (CJK, emoji), else 1.
 def cw(ch: str) -> int:
     if unicodedata.combining(ch) or ch in "️‍":
         return 0
     return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
 
 
+# Visible width of a string, ignoring colour codes.
 def vlen(s: str) -> int:
     return sum(cw(c) for c in ANSI_RE.sub("", s))
 
 
+# Cut text to width w and add an ellipsis; left=True keeps the end (useful for long paths).
 def clip(text: str, w: int, left: bool = False) -> str:
     if vlen(text) <= w:
         return text
@@ -1220,6 +1331,7 @@ def clip(text: str, w: int, left: bool = False) -> str:
     return ("…" + out) if left else (out + "…")
 
 
+# Usable terminal width, never less than 70.
 def term_width() -> int:
     return max(70, shutil.get_terminal_size((110, 20)).columns - 2)
 
@@ -1230,6 +1342,7 @@ def table(headers: list[str], rows: list[list], aligns: str, color: bool, flex: 
     flex, clip_left = flex or [], clip_left or set()
     norm = [[c if isinstance(c, tuple) else (str(c), "") for c in row] for row in rows]
     n = len(headers)
+    # Column width = longest cell. Then shrink the flexible columns until the table fits.
     widths = [max([vlen(headers[i])] + [vlen(r[i][0]) for r in norm]) for i in range(n)]
     over = sum(widths) + 3 * n + 1 + len(indent) - term_width()
     for i in flex:
@@ -1239,6 +1352,7 @@ def table(headers: list[str], rows: list[list], aligns: str, color: bool, flex: 
         widths[i] -= cut
         over -= cut
 
+    # Clip, pad and align one cell (l = left, r = right, anything else = centred).
     def cell(text: str, code: str, i: int, align: str) -> str:
         text = clip(text, widths[i], i in clip_left) if not ANSI_RE.search(text) else text
         pad = " " * (widths[i] - vlen(text))
@@ -1265,6 +1379,7 @@ def show(findings: list[Finding], stats: dict, rows: list[dict] | None = None) -
     rows = rows if rows is not None else category_rows(findings)
     du_ = shutil.disk_usage("/")
     mi = meminfo()
+    # Reclaimable storage bytes grouped by safety level.
     by_safety = {"safe": 0, "review": 0, "caution": 0}
     for r in rows:
         if r["module"] == "storage":
@@ -1281,6 +1396,7 @@ def show(findings: list[Finding], stats: dict, rows: list[dict] | None = None) -
 
     print()
     rrows = [res("💾 Disk", du_.used / du_.total, human(du_.used), human(du_.free), human(du_.total))]
+    # 'After cleanup' counts safe and review items. Caution items are left out.
     freeable = by_safety["safe"] + by_safety["review"]
     if freeable:
         p2 = max(0, du_.used - freeable) / du_.total
@@ -1316,8 +1432,11 @@ def show(findings: list[Finding], stats: dict, rows: list[dict] | None = None) -
         print()
         table(["Note", "Detail"], notes, "ll", color, flex=[1], title=paint("ℹ NOTES", BOLD, color))
 
+    # The biggest category sets the full bar, so the small bars are comparable.
     biggest = max([r["size"] for r in rows if r["module"] != "claude"] + [1])
     for mod in MODULES:
+        # Hide the 'notes' row and tidy-only rows with nothing to fix, unless something was just
+        # cleaned.
         mrows = [r for r in rows if r["module"] == mod and not ((r["key"] == "notes" or (r["key"] == "mem-tidy" and not r["fixable"])) and not r.get("cleaned"))]
         if not mrows:
             continue
@@ -1341,6 +1460,7 @@ def show(findings: list[Finding], stats: dict, rows: list[dict] | None = None) -
     return rows
 
 
+# Print one table per category listing its items (top `limit` by size; None = all).
 def show_details(rows: list[dict], keys: list[str] | None, limit: int | None = 15) -> None:
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     for r in rows:
@@ -1361,6 +1481,7 @@ def show_details(rows: list[dict], keys: list[str] | None, limit: int | None = 1
             print(f"  ... and {len(items) - limit} more (cleanup --scan -c {r['key']} --all)")
 
 
+# Short note for the plan list saying what a change does to the user (quit app, sudo, undo).
 def plan_tag(f: Finding) -> str:
     rk = recover_kind(f)
     tags = []
@@ -1390,6 +1511,9 @@ def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]
         print("--clean needs a terminal to ask questions (or pass -y / --dry-run).", file=sys.stderr)
         return []
     # index lines bottom-up; harmless items first, sudo next, app-quitting items always last
+    # Sort key: risk rank first (0 plain, 1 sudo, 2 quits an app), then higher index line
+    # numbers
+    # first (deleting from the bottom keeps the other line numbers valid), then bigger size.
     items.sort(key=lambda f: ({"terminate": 2, "sudo": 1}.get(f.risk, 0), -f.fix.get("line", 0), -f.size))
     print(f"\nPlanned changes ({len(items)}):")
     for i, f in enumerate(items, 1):
@@ -1402,6 +1526,7 @@ def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]
         return []
     n_irr = sum(1 for f in items if recover_kind(f) == "irreversible")
     n_term = sum(1 for f in items if f.risk == "terminate")
+    # y = apply everything in the list, o = ask for each item. Anything else cancels.
     mode = "y" if assume_yes else key("\n  [y] yes to all / [o] one by one / [N] cancel: ", "n")
     if mode not in ("y", "o"):
         print("  cancelled, nothing changed.")
@@ -1418,6 +1543,7 @@ def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]
             if rk == "irreversible" and not allow_irr:
                 print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  skipped (cannot be undone)")
                 continue
+            # -y never quits a running app. That always needs a person to confirm.
             if f.risk == "terminate" and assume_yes:
                 print(f"\n[{MODULE_TITLE[f.module]}] {f.kind}: {f.where}\n  skipped (quits a running app; run without -y)")
                 continue
@@ -1428,6 +1554,7 @@ def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]
                 if input("  this CANNOT be undone. Type 'yes' to continue: ").strip() != "yes":
                     continue
             else:
+                # Permanent delete is offered only for archived storage items.
                 perm_ok = f.fix["op"] == "trash" and f.module == "storage"
                 ans = key("  apply? [y]es / [N]o / [q]uit" + (" / [p]ermanent delete now" if perm_ok else "") + ": ", "n")
                 if ans == "q":
@@ -1446,6 +1573,8 @@ def clean(findings: list[Finding], assume_yes: bool, dry: bool) -> list[Finding]
                 freed_now += f.size
         except Exception as e:  # keep going; one failure must not lose the manifest
             print(f"  failed: {e}")
+        # Save the manifest after every item, so a later failure cannot lose the undo
+        # information.
         batch.save()
         batch.entries = []
     print(f"\n{done} change(s) applied." + (f" Freed at once: {human(freed_now)}." if freed_now else ""))
@@ -1505,6 +1634,7 @@ def explore(args) -> None:
                 show(findings, stats, rows)
 
 
+# Interactive main menu shown when run with no options on a terminal.
 def menu(args) -> int:
     while True:
         n = len(list_batches())
@@ -1531,6 +1661,7 @@ def menu(args) -> int:
             return 0
 
 
+# Handle one command: the list/recover/purge/json shortcuts first, else scan (and clean).
 def main() -> int:
     args = build_parser().parse_args()
     if args.list_trash:
@@ -1568,6 +1699,7 @@ def main() -> int:
     return 0
 
 
+# Wrap main() so Ctrl-C, Ctrl-D and a closed pipe end quietly instead of showing a traceback.
 def run_main() -> int:
     try:
         return main()
